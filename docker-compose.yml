@@ -1,0 +1,114 @@
+version: '3.8'
+
+services:
+  # -----------------------------
+  # The Nervous System (Redis)
+  # -----------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: krastix-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # -----------------------------
+  # The Brain (Orchestrator API)
+  # -----------------------------
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.api
+    container_name: krastix-api
+    ports:
+      - "8000:8000"
+    restart: on-failure
+    environment:
+      # Crucial for Oracle Cloud Intra-Container Comms
+      - REDIS_URL=redis://redis:6379/0
+      # Pass through other keys
+      - DATABASE_URL=${DATABASE_URL}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+    command: uvicorn orchestrator_engine.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # -----------------------------
+  # The Hands (Microservice Agents)
+  # -----------------------------
+  
+  # 1. CRM Agent (Sales)
+  crm_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
+    container_name: krastix-crm-worker
+    restart: on-failure
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=${DATABASE_URL}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+    # Using shared.mq:celery_app which we just created
+    command: celery -A shared.mq:celery_app worker --loglevel=info -Q crm_queue
+
+  # 2. Research Agent (General)
+  research_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
+    container_name: krastix-research-worker
+    restart: on-failure
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=${DATABASE_URL}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+    command: celery -A shared.mq:celery_app worker --loglevel=info -Q research_queue
+
+  # 3. Form Agent (HR/Admin)
+  form_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
+    container_name: krastix-form-worker
+    restart: on-failure
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=${DATABASE_URL}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+    command: celery -A shared.mq:celery_app worker --loglevel=info -Q form_queue
+
+volumes:
+  redis_data:

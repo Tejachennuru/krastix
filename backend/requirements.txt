@@ -1,0 +1,17 @@
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.5.3
+pydantic-settings==2.1.0
+psycopg2-binary==2.9.9
+sqlalchemy==2.0.25
+redis==5.0.1
+celery==5.3.6
+langgraph
+langchain
+langchain-google-genai
+google-generativeai
+python-dotenv==1.0.0
+httpx==0.26.0
+aiohttp==3.9.1
+asyncpg==0.29.0
+pgvector==0.2.4
