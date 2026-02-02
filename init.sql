@@ -1,5 +1,5 @@
 -- ============================================
--- KRASTIX ORCHESTRATOR – MASTER PRODUCTION SCHEMA
+-- KRASTIX ORCHESTRATOR – COMPLETE PRODUCTION SCHEMA
 -- Architecture: Data-Driven, Event-Sourced, Microservices-Ready
 -- Status: HARDENED & SCALABLE
 -- ============================================
@@ -36,12 +36,10 @@ CREATE TABLE IF NOT EXISTS domain_configs (
 );
 
 -- Entity Registry: Defines the "Shape" of data (The Rulebook)
--- Agents cannot invent new types; they must follow these schemas.
 CREATE TABLE IF NOT EXISTS entity_definitions (
     entity_type VARCHAR(100) PRIMARY KEY,
     description TEXT,
-    -- JSON Schema to validate data upstream in Python
-    validation_schema JSONB NOT NULL, 
+    validation_schema JSONB NOT NULL,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -53,7 +51,6 @@ CREATE TABLE IF NOT EXISTS entity_definitions (
 CREATE OR REPLACE FUNCTION extract_skills_from_data(data jsonb)
 RETURNS text[] AS $$
 BEGIN
-    -- Returns null if 'skills' key doesn't exist or isn't an array
     IF jsonb_typeof(data->'skills') = 'array' THEN
         RETURN ARRAY(SELECT jsonb_array_elements_text(data->'skills'));
     ELSE
@@ -66,54 +63,48 @@ $$ LANGUAGE plpgsql IMMUTABLE;
 CREATE TABLE IF NOT EXISTS entities (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
-    
-    -- Foreign Key enforces that 'candidate' or 'flight' must exist in definitions
-    entity_type VARCHAR(100) NOT NULL REFERENCES entity_definitions(entity_type), 
-    
-    display_name TEXT, -- Human readable label
-    status VARCHAR(50), -- High-level status
-    
-    -- THE PAYLOAD: Stores specific fields (skills, prices, dates)
-    data JSONB DEFAULT '{}'::jsonb, 
-    
-    -- PERFORMANCE BOOSTER: Uses the function above
-    derived_skills TEXT[] GENERATED ALWAYS AS (
-        extract_skills_from_data(data)
-    ) STORED,
-
+    entity_type VARCHAR(100) NOT NULL REFERENCES entity_definitions(entity_type),
+    display_name TEXT,
+    status VARCHAR(50),
+    data JSONB DEFAULT '{}'::jsonb,
+    derived_skills TEXT[] GENERATED ALWAYS AS (extract_skills_from_data(data)) STORED,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- GIN Indexes (Critical for JSONB Performance)
-CREATE INDEX idx_entities_data ON entities USING gin (data);
-CREATE INDEX idx_entities_skills ON entities USING gin (derived_skills);
-CREATE INDEX idx_entities_user_type ON entities(user_id, entity_type);
+CREATE INDEX IF NOT EXISTS idx_entities_data ON entities USING gin (data);
+CREATE INDEX IF NOT EXISTS idx_entities_skills ON entities USING gin (derived_skills);
+CREATE INDEX IF NOT EXISTS idx_entities_user_type ON entities(user_id, entity_type);
+
+-- Batch Jobs (The "Mission Control" for HR/Deadlines)
+CREATE TABLE IF NOT EXISTS batch_jobs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+    domain_key VARCHAR(100) NOT NULL REFERENCES domain_configs(domain_key),
+    batch_type VARCHAR(100) NOT NULL,
+    status VARCHAR(50) DEFAULT 'pending',
+    entity_ids UUID[] NOT NULL,
+    instruction TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    processed_at TIMESTAMPTZ
+);
 
 -- --------------------------------------------
 -- 5. THE "BLACK BOX" (Audit History)
 -- --------------------------------------------
-
--- Tracks every change an agent makes. Crucial for AI accountability.
 CREATE TABLE IF NOT EXISTS entity_events (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     entity_id UUID NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
-    
-    -- "status_change", "data_update", "email_sent"
-    event_type VARCHAR(100) NOT NULL, 
-    
-    -- The "Diff": {"old_status": "new", "new_status": "hired"}
-    payload JSONB, 
-    
+    event_type VARCHAR(100) NOT NULL,
+    payload JSONB,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
-CREATE INDEX idx_entity_events_entity ON entity_events(entity_id);
+CREATE INDEX IF NOT EXISTS idx_entity_events_entity ON entity_events(entity_id);
 
 -- --------------------------------------------
 -- 6. ORCHESTRATION & MEMORY
 -- --------------------------------------------
-
--- Agent Task Queue (State management)
 CREATE TABLE IF NOT EXISTS agent_tasks (
     task_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
@@ -126,10 +117,10 @@ CREATE TABLE IF NOT EXISTS agent_tasks (
     created_at TIMESTAMPTZ DEFAULT NOW(),
     completed_at TIMESTAMPTZ
 );
-CREATE INDEX idx_agent_tasks_status ON agent_tasks(status);
-CREATE INDEX idx_agent_tasks_user ON agent_tasks(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_tasks_status ON agent_tasks(status);
+CREATE INDEX IF NOT EXISTS idx_agent_tasks_user ON agent_tasks(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_tasks_session_id ON agent_tasks ((input_payload->>'session_id'));
 
--- Chat History & Planning
 CREATE TABLE IF NOT EXISTS conversations (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
@@ -141,19 +132,17 @@ CREATE TABLE IF NOT EXISTS conversations (
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Vector Memory (RAG)
 CREATE TABLE IF NOT EXISTS memories (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
     domain_key VARCHAR(100) NOT NULL,
     content TEXT NOT NULL,
-    embedding vector(768), -- Dimensions for Gemini/OpenAI
+    embedding vector(768),
     metadata JSONB,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
-CREATE INDEX idx_memories_user_domain ON memories(user_id, domain_key);
+CREATE INDEX IF NOT EXISTS idx_memories_user_domain ON memories(user_id, domain_key);
 
--- OAuth Integrations
 CREATE TABLE IF NOT EXISTS integrations (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
@@ -167,7 +156,30 @@ CREATE TABLE IF NOT EXISTS integrations (
 );
 
 -- --------------------------------------------
--- 7. SECURITY (Row Level Security)
+-- 7. LANGGRAPH CHECKPOINTS (Persistent Memory)
+-- --------------------------------------------
+CREATE TABLE IF NOT EXISTS checkpoints (
+    thread_id TEXT NOT NULL,
+    checkpoint_id TEXT NOT NULL,
+    parent_id TEXT,
+    checkpoint BYTEA NOT NULL,
+    metadata JSONB NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    PRIMARY KEY (thread_id, checkpoint_id)
+);
+
+CREATE TABLE IF NOT EXISTS checkpoint_writes (
+    thread_id TEXT NOT NULL,
+    checkpoint_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    idx INTEGER NOT NULL,
+    channel TEXT NOT NULL,
+    value BYTEA NOT NULL,
+    PRIMARY KEY (thread_id, checkpoint_id, task_id, idx)
+);
+
+-- --------------------------------------------
+-- 8. SECURITY (Row Level Security)
 -- --------------------------------------------
 ALTER TABLE profiles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE domain_configs ENABLE ROW LEVEL SECURITY;
@@ -178,36 +190,100 @@ ALTER TABLE agent_tasks ENABLE ROW LEVEL SECURITY;
 ALTER TABLE conversations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE memories ENABLE ROW LEVEL SECURITY;
 ALTER TABLE integrations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE checkpoints ENABLE ROW LEVEL SECURITY;
+ALTER TABLE checkpoint_writes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE batch_jobs ENABLE ROW LEVEL SECURITY;
 
 -- User Policies (Can only see their own data)
-CREATE POLICY "user_owns_profile" ON profiles FOR ALL USING (auth.uid() = id);
-CREATE POLICY "user_owns_entities" ON entities FOR ALL USING (auth.uid() = user_id);
-CREATE POLICY "user_owns_events" ON entity_events FOR ALL USING (auth.uid() = (SELECT user_id FROM entities WHERE id = entity_events.entity_id));
-CREATE POLICY "user_owns_tasks" ON agent_tasks FOR ALL USING (auth.uid() = user_id);
-CREATE POLICY "user_owns_conversations" ON conversations FOR ALL USING (auth.uid() = user_id);
-CREATE POLICY "user_owns_memories" ON memories FOR ALL USING (auth.uid() = user_id);
-CREATE POLICY "user_owns_integrations" ON integrations FOR ALL USING (auth.uid() = user_id);
+DO $$ BEGIN
+    CREATE POLICY "user_owns_profile" ON profiles FOR ALL USING (auth.uid() = id);
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    CREATE POLICY "user_owns_entities" ON entities FOR ALL USING (auth.uid() = user_id);
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    CREATE POLICY "user_owns_events" ON entity_events FOR ALL USING (auth.uid() = (SELECT user_id FROM entities WHERE id = entity_events.entity_id));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    CREATE POLICY "user_owns_tasks" ON agent_tasks FOR ALL USING (auth.uid() = user_id);
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    CREATE POLICY "user_owns_conversations" ON conversations FOR ALL USING (auth.uid() = user_id);
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    CREATE POLICY "user_owns_memories" ON memories FOR ALL USING (auth.uid() = user_id);
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    CREATE POLICY "user_owns_integrations" ON integrations FOR ALL USING (auth.uid() = user_id);
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    CREATE POLICY "user_owns_batch_jobs" ON batch_jobs FOR ALL USING (auth.uid() = user_id);
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 -- Public Read Policies (Configs are shared)
-CREATE POLICY "public_read_domain_configs" ON domain_configs FOR SELECT USING (true);
-CREATE POLICY "public_read_entity_definitions" ON entity_definitions FOR SELECT USING (true);
+DO $$ BEGIN
+    CREATE POLICY "public_read_domain_configs" ON domain_configs FOR SELECT USING (true);
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    CREATE POLICY "public_read_entity_definitions" ON entity_definitions FOR SELECT USING (true);
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 -- Service Role Policies (Backend/Workers have full access)
-CREATE POLICY "service_full_access_profiles" ON profiles FOR ALL USING (auth.role() = 'service_role');
-CREATE POLICY "service_full_access_entities" ON entities FOR ALL USING (auth.role() = 'service_role');
-CREATE POLICY "service_full_access_events" ON entity_events FOR ALL USING (auth.role() = 'service_role');
-CREATE POLICY "service_full_access_tasks" ON agent_tasks FOR ALL USING (auth.role() = 'service_role');
-CREATE POLICY "service_full_access_conversations" ON conversations FOR ALL USING (auth.role() = 'service_role');
-CREATE POLICY "service_full_access_memories" ON memories FOR ALL USING (auth.role() = 'service_role');
-CREATE POLICY "service_full_access_integrations" ON integrations FOR ALL USING (auth.role() = 'service_role');
+DO $$ BEGIN
+    CREATE POLICY "service_full_access_profiles" ON profiles FOR ALL USING (auth.role() = 'service_role');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    CREATE POLICY "service_full_access_entities" ON entities FOR ALL USING (auth.role() = 'service_role');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    CREATE POLICY "service_full_access_events" ON entity_events FOR ALL USING (auth.role() = 'service_role');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    CREATE POLICY "service_full_access_tasks" ON agent_tasks FOR ALL USING (auth.role() = 'service_role');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    CREATE POLICY "service_full_access_conversations" ON conversations FOR ALL USING (auth.role() = 'service_role');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    CREATE POLICY "service_full_access_memories" ON memories FOR ALL USING (auth.role() = 'service_role');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    CREATE POLICY "service_full_access_integrations" ON integrations FOR ALL USING (auth.role() = 'service_role');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    CREATE POLICY "service_full_access_checkpoints" ON checkpoints FOR ALL USING (auth.role() = 'service_role');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    CREATE POLICY "service_full_access_checkpoint_writes" ON checkpoint_writes FOR ALL USING (auth.role() = 'service_role');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    CREATE POLICY "service_full_access_batch_jobs" ON batch_jobs FOR ALL USING (auth.role() = 'service_role');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 -- --------------------------------------------
--- 8. SEED DATA (The Default Setup)
+-- 9. SEED DATA (The Default Setup)
 -- --------------------------------------------
 
--- 8.1 Define the Domain Logic
+-- 9.1 Define the Domain Logic
 INSERT INTO domain_configs (domain_key, display_name, system_prompt, allowed_agent_queues) VALUES
-('HR_RECRUITER', 'HR Recruitment Assistant', 
+('HR_RECRUITER', 'HR Recruitment Assistant',
 'You are an AI HR Recruitment Assistant responsible for managing and supporting end-to-end recruitment operations.
 Core Function
 Your primary function is to assist with candidate sourcing, screening, coordination, and communication while ensuring a professional and efficient hiring process.
@@ -282,7 +358,7 @@ Act as a searchable, reliable second brain for the user
 
 Agent Orchestration & Tool Usage
 You have access to multiple tools, MCP servers, and agents
-Maintain awareness of each tool’s capabilities and limitations
+Maintain awareness of each tool's capabilities and limitations
 Analyze user requests and determine the best execution path
 Delegate tasks to the appropriate agent or MCP server when required
 Coordinate multi-step tasks autonomously
@@ -295,23 +371,23 @@ Prioritize accuracy, privacy, and efficiency
 Adapt to user habits, preferences, and routines over time
 
 Operating Principle
-Autonomously manage personal workflows, communications, and life logistics by planning intelligently, executing reliably, and acting as an extension of the user’s memory and decision-making.',
+Autonomously manage personal workflows, communications, and life logistics by planning intelligently, executing reliably, and acting as an extension of the user''s memory and decision-making.',
 '["research_queue"]'::jsonb)
 ON CONFLICT (domain_key) DO NOTHING;
 
--- 8.2 Define the Data Rules (The Brakes)
+-- 9.2 Define the Data Rules (The Brakes)
 INSERT INTO entity_definitions (entity_type, description, validation_schema) VALUES
 (
-    'candidate', 
+    'candidate',
     'A potential hire for a job role',
     '{
-        "type": "object", 
+        "type": "object",
         "properties": {
-            "email": {"type": "string"}, 
-            "phone": {"type": "string"}, 
+            "email": {"type": "string"},
+            "phone": {"type": "string"},
             "skills": {"type": "array", "items": {"type": "string"}},
             "linkedin_url": {"type": "string"}
-        }, 
+        },
         "required": ["email", "skills"]
     }'::jsonb
 ),
@@ -319,23 +395,23 @@ INSERT INTO entity_definitions (entity_type, description, validation_schema) VAL
     'flight_booking',
     'A travel reservation',
     '{
-        "type": "object", 
+        "type": "object",
         "properties": {
-            "pnr": {"type": "string"}, 
-            "airline": {"type": "string"}, 
+            "pnr": {"type": "string"},
+            "airline": {"type": "string"},
             "price": {"type": "number"},
             "departure_time": {"type": "string"}
-        }, 
+        },
         "required": ["pnr", "price"]
     }'::jsonb
 )
 ON CONFLICT (entity_type) DO NOTHING;
 
--- 8.3 Seed Test User
-INSERT INTO profiles (email, tier, credits)
-VALUES ('test@example.com', 'pro', 1000)
+-- 9.3 Seed Test User
+INSERT INTO profiles (id, email, tier, credits)
+VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'test@example.com', 'pro', 1000)
 ON CONFLICT (email) DO NOTHING;
 
-
-
-
+-- ============================================
+-- SCHEMA DEPLOYMENT COMPLETE
+-- ============================================

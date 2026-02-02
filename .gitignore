@@ -1,0 +1,43 @@
+# --- General ---
+.DS_Store
+Thumbs.db
+*.log
+
+# --- Environment Configuration ---
+.env
+.env.local
+.env.*.local
+# Keep example files
+!.env.example
+
+# --- Python (Backend) ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+venv/
+.venv/
+env/
+.env/
+backend/venv/
+backend/.venv/
+
+# --- Node.js / Vite (Frontend) ---
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+frontend/.npm/
+frontend/.eslintcache
+frontend/*.log
+
+# --- IDEs & Editors ---
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# --- Docker ---
+docker-compose.override.yml
