@@ -30,16 +30,14 @@ services:
     dns:
       - 8.8.8.8
       - 8.8.4.4
-    extra_hosts:
-      - "aws-1-ap-southeast-1.pooler.supabase.com:13.213.241.248"
-      - "generativelanguage.googleapis.com:216.239.38.223"
     environment:
       - REDIS_URL=redis://redis:6379/0
       - DATABASE_URL=${DATABASE_URL}
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
       - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL}
+      - OLLAMA_MODEL=${OLLAMA_MODEL}
     depends_on:
       redis:
         condition: service_healthy
@@ -57,15 +55,16 @@ services:
       dockerfile: agents/crm_agent/Dockerfile
     container_name: krastix-crm-agent
     restart: on-failure
-    extra_hosts:
-      - "aws-1-ap-southeast-1.pooler.supabase.com:13.213.241.248"
-      - "generativelanguage.googleapis.com:216.239.38.223"
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
     environment:
       - REDIS_URL=redis://redis:6379/0
       - DATABASE_URL=${DATABASE_URL}
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL}
+      - OLLAMA_MODEL=${OLLAMA_MODEL}
     depends_on:
       redis:
         condition: service_healthy
@@ -86,13 +85,15 @@ services:
     ports:
       - "8001:8001"
     restart: on-failure
-    extra_hosts:
-      - "generativelanguage.googleapis.com:216.239.38.223"
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
     environment:
       - ORCHESTRATOR_URL=http://orchestrator:8000
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
       - FIRECRAWL_API_KEY=${FIRECRAWL_API_KEY}
       - SCRAPECREATORS_API_KEY=${SCRAPECREATORS_API_KEY}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL}
+      - OLLAMA_MODEL=${OLLAMA_MODEL}
     volumes:
       - ./agents/research_agent:/app
     command: uvicorn src.main:app --host 0.0.0.0 --port 8001 --reload
@@ -106,15 +107,15 @@ services:
       dockerfile: agents/form_agent/Dockerfile
     container_name: krastix-form-agent
     restart: on-failure
-    extra_hosts:
-      - "aws-1-ap-southeast-1.pooler.supabase.com:13.213.241.248"
-      - "generativelanguage.googleapis.com:216.239.38.223"
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
     environment:
       - REDIS_URL=redis://redis:6379/0
-      - DATABASE_URL=${DATABASE_URL}
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL}
+      - OLLAMA_MODEL=${OLLAMA_MODEL}
     depends_on:
       redis:
         condition: service_healthy

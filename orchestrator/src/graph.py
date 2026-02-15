@@ -1,19 +1,22 @@
 import os
-from typing import TypedDict, List, Annotated, Optional
+import logging
+import traceback
+from typing import TypedDict, List, Annotated, Optional, Dict, Any
 from uuid import UUID
 
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_ollama import ChatOllama
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage, BaseMessage
 from langgraph.graph.message import add_messages
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-from langgraph.checkpoint.memory import MemorySaver
 
 from shared.database import db
 from shared.mq import celery_app
 from orchestrator.src.schemas import DelegateTask, QueueBatch
+
+logger = logging.getLogger(__name__)
 
 
 # --- 1. State Definition ---
@@ -30,11 +33,16 @@ class OrchestratorGraph:
         self.memory_service = memory_service
         self.db_pool = db_pool
         
-        # Initialize Gemini with Tools
-        # Using gemini-2.0-flash (current stable model)
-        llm = ChatGoogleGenerativeAI(
-            model="gemini-2.0-flash",
-            google_api_key=os.getenv("GEMINI_API_KEY"),
+        # Initialize Ollama (Local Model)
+        # Using mistral-nemo (or configured model)
+        ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
+        model_name = os.getenv("OLLAMA_MODEL", "mistral-nemo")
+        
+        logger.info(f"Initializing Orchestrator with Ollama: {model_name} at {ollama_base_url}")
+        
+        llm = ChatOllama(
+            model=model_name,
+            base_url=ollama_base_url,
             temperature=0
         )
         self.llm_with_tools = llm.bind_tools([DelegateTask, QueueBatch])
@@ -43,28 +51,33 @@ class OrchestratorGraph:
         self.checkpointer = None
         self.workflow = None
 
-    async def initialize(self):
-        """Async initialization for PostgresSaver with URL cleaning"""
+    async def initialize(self) -> None:
+        """Async initialization for PostgresSaver with URL cleaning."""
         try:
             raw_url = os.getenv("DATABASE_URL")
+            if not raw_url:
+                raise ValueError("DATABASE_URL environment variable is not set")
             # FIX: Ensure URL is compatible with psycopg (remove +asyncpg if present)
             conn_string = raw_url.replace("postgresql+asyncpg://", "postgresql://")
 
-            # Disable prepared statements for Supabase transaction pooler (port 6543)
-            self.checkpointer = AsyncPostgresSaver.from_conn_string(
-                conn_string,
-                conn_kwargs={"prepare_threshold": None} 
-            )
+            # For Supabase transaction pooler (port 6543), disable prepared statements
+            # by appending to the connection string if not already present
+            if "prepare_threshold" not in conn_string:
+                separator = "&" if "?" in conn_string else "?"
+                conn_string += f"{separator}prepare_threshold=0"
+
+            # Create the checkpointer using the async context manager
+            checkpointer = await AsyncPostgresSaver.from_conn_string(conn_string).__aenter__()
             
             # This creates the necessary 'checkpoints' tables if they don't exist
-            await self.checkpointer.setup()
-            print("✅ PostgresSaver Connected (Persistent Memory)")
+            await checkpointer.setup()
+            self.checkpointer = checkpointer
+            logger.info("PostgresSaver connected (persistent memory)")
             
         except Exception as e:
-            print(f"⚠️ Failed to init PostgresSaver: {e}")
+            logger.warning("Failed to init PostgresSaver: %s. Switching to MemorySaver (non-persistent).", e)
             # Fallback is CRITICAL so the app doesn't crash on 500
             self.checkpointer = MemorySaver()
-            print("⚠️ Switched to MemorySaver (Non-Persistent)")
         
         # Compile graph with whatever checkpointer worked
         self.workflow = self._build_graph()
@@ -90,17 +103,20 @@ class OrchestratorGraph:
 
     # --- Node Implementations ---
 
-    async def node_planner(self, state: AgentState):
+    async def node_planner(self, state: AgentState) -> Dict[str, Any]:
         """The Brain: Plans response using History + RAG Memory."""
-        print(f"🧠 Planner Activated: {state['user_id']}")
+        logger.info("Planner activated for user: %s", state['user_id'])
         
         try:
             # 1. Fetch Domain Config (Handle Defaults if DB fails)
             try:
                 config = await db.get_domain_config(state["domain"])
             except Exception as e:
-                print(f"⚠️ DB Config Error: {e}")
+                logger.error("DB Config Error for domain '%s': %s", state["domain"], e, exc_info=True)
                 config = None
+
+            if config is None:
+                logger.warning("No config found for domain '%s', using defaults.", state["domain"])
 
             sys_prompt = config["system_prompt"] if config else "You are a helpful assistant."
             # Safe list access - parse JSON string if needed
@@ -109,7 +125,8 @@ class OrchestratorGraph:
                 import json
                 try:
                     allowed_queues = json.loads(allowed_queues)
-                except:
+                except json.JSONDecodeError:
+                    logger.warning("Failed to parse allowed_agent_queues JSON, using default.")
                     allowed_queues = ["research_queue"]
             
             # 2. RAG MEMORY INJECTION
@@ -128,7 +145,7 @@ class OrchestratorGraph:
                             [f"- {r['content']}" for r in results]
                         )
                 except Exception as e:
-                    print(f"⚠️ Memory Search Failed (Non-Critical): {e}")
+                    logger.warning("Memory search failed (non-critical): %s", e)
 
             # 3. Construct Prompt
             agent_info = f"\n\nAllowed Queues: {', '.join(allowed_queues)}"
@@ -141,24 +158,23 @@ class OrchestratorGraph:
             try:
                 response = await self.llm_with_tools.ainvoke(messages)
             except Exception as e:
-                print(f"❌ LLM Error: {e}")
+                logger.error("LLM invocation failed: %s", e, exc_info=True)
                 return {"messages": [AIMessage(content="I'm having trouble connecting to my brain (LLM Error). Please try again.")]}
             
             return {"messages": [response]}
 
         except Exception as e:
-            import traceback
-            print(f"🔥 CRITICAL PLANNER ERROR: {traceback.format_exc()}")
+            logger.critical("CRITICAL PLANNER ERROR: %s", e, exc_info=True)
             return {"messages": [AIMessage(content="An internal error occurred in the planning module.")]}
 
-    def should_delegate(self, state: AgentState):
+    def should_delegate(self, state: AgentState) -> str:
         """Check if the last message has tool calls."""
         last_message = state["messages"][-1]
         if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
             return "delegate"
         return "respond"
 
-    async def node_dispatcher(self, state: AgentState, config: RunnableConfig):
+    async def node_dispatcher(self, state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
         """The Hands: Executes Tool Calls (DelegateTask, QueueBatch)."""
         last_message = state["messages"][-1]
         tool_outputs = []
@@ -166,7 +182,11 @@ class OrchestratorGraph:
         thread_id = config.get("configurable", {}).get("thread_id", "unknown_session")
         
         # Fetch allowed queues for validation
-        domain_config = await db.get_domain_config(state["domain"])
+        try:
+            domain_config = await db.get_domain_config(state["domain"])
+        except Exception as e:
+            logger.error("Failed to fetch domain config in dispatcher: %s", e, exc_info=True)
+            domain_config = None
         allowed_queues = domain_config.get("allowed_agent_queues", []) if domain_config else []
 
         for tool_call in last_message.tool_calls:
@@ -208,7 +228,7 @@ class OrchestratorGraph:
                 tool_outputs.append(
                     ToolMessage(
                         tool_call_id=tool_call["id"],
-                        content=f"✅ Task {task_id} dispatched to {queue}. I will notify you when complete."
+                        content=f"Task {task_id} dispatched to {queue}. I will notify you when complete."
                     )
                 )
                 state["current_task_id"] = str(task_id)
@@ -225,14 +245,14 @@ class OrchestratorGraph:
                 tool_outputs.append(
                     ToolMessage(
                         tool_call_id=tool_call["id"],
-                        content=f"📋 Batch {batch_id} queued for manager approval."
+                        content=f"Batch {batch_id} queued for manager approval."
                     )
                 )
 
         return {"messages": tool_outputs}
 
     # --- Public Interface ---
-    async def process_message(self, user_id: str, domain: str, message: str, thread_id: str, role: str = "user"):
+    async def process_message(self, user_id: str, domain: str, message: str, thread_id: str, role: str = "user") -> Dict[str, Any]:
         """
         Runs the graph. Supports both User messages and System notifications (Wake-up).
         """

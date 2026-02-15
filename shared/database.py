@@ -1,4 +1,5 @@
 import os
+import logging
 import socket
 import json
 import asyncpg
@@ -7,12 +8,15 @@ from typing import Optional, Dict, Any, List
 from uuid import UUID, uuid4
 from datetime import datetime
 
+logger = logging.getLogger(__name__)
+
+
 class Database:
     def __init__(self):
         self.pool: Optional[asyncpg.Pool] = None
         self.database_url = os.getenv("DATABASE_URL")
         
-    async def connect(self):
+    async def connect(self) -> None:
         """
         Initialize connection pool with IPv4 resolution fix for Docker/WSL2.
         """
@@ -30,17 +34,17 @@ class Database:
 
         # 2. FORCE IPv4 RESOLUTION (The Fix)
         try:
-            print(f"🔍 Resolving IP for {hostname}...")
+            logger.info("Resolving IP for %s...", hostname)
             host_ip = socket.gethostbyname(hostname)
-            print(f"✅ Resolved to IPv4: {host_ip}")
+            logger.info("Resolved to IPv4: %s", host_ip)
             
             new_netloc = parsed.netloc.replace(hostname, host_ip)
             connection_url = parsed._replace(netloc=new_netloc).geturl()
             
         except Exception as e:
-            print(f"⚠️ DNS Resolution failed ({e}). Falling back to original URL.")
+            logger.warning("DNS Resolution failed (%s). Falling back to original URL.", e)
 
-        print(f"🔌 Connecting to Database at {host_ip}:{port}...")
+        logger.info("Connecting to Database at %s:%s...", host_ip, port)
 
         # 3. Create the Connection Pool
         if not self.pool:
@@ -53,19 +57,16 @@ class Database:
                     statement_cache_size=0, # Fixed for Supabase PgBouncer
                     ssl="require" 
                 )
-                print("🚀 Database Connected Successfully!")
+                logger.info("Database connected successfully")
             except Exception as e:
-                print(f"❌ Database Connection Failed: {e}")
-                # Don't raise e here to allow app to start in degraded mode if needed, 
-                # but main.py relies on db, so maybe raising is better? 
-                # Preserving original behavior which raised e.
-                raise e
+                logger.error("Database connection failed: %s", e, exc_info=True)
+                raise
             
-    async def disconnect(self):
-        """Close connection pool"""
+    async def disconnect(self) -> None:
+        """Close connection pool."""
         if self.pool:
             await self.pool.close()
-            print("Database Disconnected")
+            logger.info("Database disconnected")
             
     # --- Configuration & Users ---
 

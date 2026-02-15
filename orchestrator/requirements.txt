@@ -6,9 +6,8 @@ asyncpg==0.29.0
 redis==5.0.1
 celery==5.3.6
 python-dotenv==1.0.0
-google-genai
 langgraph>=0.2.0
 langchain-core
-langchain-google-genai
+langchain-ollama
 langgraph-checkpoint-postgres
 psycopg[binary,pool]

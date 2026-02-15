@@ -1,32 +1,41 @@
 import os
+import re
 import json
+import logging
 from uuid import UUID
-from google import genai
-from google.genai import types
+from typing import Optional, List, Dict, Any
+from langchain_ollama import OllamaEmbeddings
 import asyncpg
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
+
+# Whitelist pattern: only allow alphanumeric keys with underscores
+_VALID_METADATA_KEY = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]{0,63}$')
+
 
 class MemoryService:
     def __init__(self, db_pool):
         self.db_pool = db_pool
-        # Initialize modern SDK client
-        self.client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+        # Initialize Ollama Embeddings
+        ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
+        self.embeddings = OllamaEmbeddings(
+            model="nomic-embed-text",
+            base_url=ollama_base_url
+        )
 
-    async def get_embedding(self, text: str):
-        """Generates a vector embedding using text-embedding-004 (768 dimensions)"""
+    async def get_embedding(self, text: str) -> Optional[List[float]]:
+        """Generates a vector embedding using nomic-embed-text (768 dimensions)."""
         try:
-            result = self.client.models.embed_content(
-                model="text-embedding-004",
-                contents=text,
-                config=types.EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT")
-            )
-            return result.embeddings[0].values
+            # Langchain's embed_query is synchronous, but usually fast enough for local. 
+            # If blocking becomes an issue, run in executor.
+            return self.embeddings.embed_query(text)
         except Exception as e:
-            print(f"❌ Embedding Error: {e}")
+            logger.error("Embedding generation failed: %s", e, exc_info=True)
             return None
 
-    async def save_memory(self, user_id: str, domain: str, content: str, metadata: dict):
-        """Saves text + vector + metadata with strict UUID validation"""
+    async def save_memory(self, user_id: str, domain: str, content: str, metadata: dict) -> Optional[str]:
+        """Saves text + vector + metadata with strict UUID validation."""
         try:
             valid_user_id = UUID(user_id)
             vector = await self.get_embedding(content)
@@ -44,11 +53,11 @@ class MemoryService:
                 row = await conn.fetchrow(query, valid_user_id, domain, content, str(vector), json.dumps(metadata))
                 return str(row['id'])
         except Exception as e:
-            print(f"❌ Save Memory Error: {e}")
-            raise e
+            logger.error("Save memory failed: %s", e, exc_info=True)
+            raise
 
-    async def search_memory(self, user_id: str, query_text: str, filter_metadata: dict = None, limit: int = 5):
-        """Context-Aware Semantic Search using metadata filtering"""
+    async def search_memory(self, user_id: str, query_text: str, filter_metadata: Optional[Dict[str, Any]] = None, limit: int = 5) -> List[Dict[str, Any]]:
+        """Context-Aware Semantic Search using metadata filtering."""
         try:
             valid_user_id = UUID(user_id)
             query_vector = await self.get_embedding(query_text)
@@ -63,6 +72,10 @@ class MemoryService:
 
             if filter_metadata:
                 for key, value in filter_metadata.items():
+                    # Validate metadata key against whitelist to prevent SQL injection
+                    if not _VALID_METADATA_KEY.match(key):
+                        logger.warning("Rejected invalid metadata key: %r", key)
+                        continue
                     where_clauses.append(f"metadata->>'{key}' = ${arg_counter}")
                     args.append(str(value))
                     arg_counter += 1
@@ -84,8 +97,8 @@ class MemoryService:
                 return [dict(r) for r in results]
                 
         except ValueError:
-            print("❌ Search Error: Invalid UUID format provided")
+            logger.error("Search error: Invalid UUID format provided")
             return []
         except Exception as e:
-            print(f"❌ Search Error: {e}")
+            logger.error("Search error: %s", e, exc_info=True)
             return []

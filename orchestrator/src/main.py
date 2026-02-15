@@ -1,3 +1,4 @@
+import logging
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -8,6 +9,8 @@ from shared.database import db
 from shared.mq import celery_app
 from orchestrator.src.graph import OrchestratorGraph
 from orchestrator.src.services.memory import MemoryService
+
+logger = logging.getLogger(__name__)
 
 # Internal Services
 brain: Optional[OrchestratorGraph] = None
@@ -34,22 +37,22 @@ class BatchTrigger(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global brain, memory_service
-    print("🚀 Orchestrator (Enterprise Edition) Starting...")
+    logger.info("Orchestrator starting...")
     
     await db.connect()
     
     if db.pool:
         # 1. Init Memory Service
         memory_service = MemoryService(db.pool)
-        print("🧠 Memory Service Connected")
+        logger.info("Memory service connected")
         
         # 2. Init Brain with Memory + DB Pool for PostgresSaver
         brain = OrchestratorGraph(memory_service=memory_service, db_pool=db.pool)
         await brain.initialize()  # Async init for PostgresSaver
-        print("🤖 Graph Brain Loaded with Persistent Checkpoints")
+        logger.info("Graph brain loaded with persistent checkpoints")
     
     yield
-    print("🛑 Orchestrator Shutting Down...")
+    logger.info("Orchestrator shutting down...")
     await db.disconnect()
 
 app = FastAPI(title="Krastix Orchestrator", lifespan=lifespan)
@@ -71,10 +74,10 @@ from fastapi.responses import JSONResponse
 async def global_exception_handler(request: Request, exc: Exception):
     import traceback
     error_details = traceback.format_exc()
-    print(f"🔥 SERVER ERROR: {error_details}")  # Print to console
+    logger.error("Unhandled server error: %s", error_details)
     return JSONResponse(
         status_code=500,
-        content={"message": "Internal Server Error", "details": str(exc), "trace": error_details.split("\n")}
+        content={"message": "Internal Server Error", "details": str(exc)}
     )
 
 # --- Health Check ---
@@ -135,7 +138,7 @@ async def chat_endpoint(req: ChatRequest):
         await db.save_message(req.user_id, "user", req.message, req.session_id)
         await db.save_message(req.user_id, "assistant", str(result["response"]), req.session_id)
     except Exception as e:
-        print(f"⚠️ Failed to save audit log: {e}")
+        logger.warning("Failed to save audit log: %s", e)
 
     return result
 
@@ -146,7 +149,7 @@ async def agent_callback(payload: TaskCallback):
     1. Update DB task status.
     2. 'Wake Up' the Graph to notify the user.
     """
-    print(f"📩 Task {payload.task_id} Finished: {payload.status}")
+    logger.info("Task %s finished: %s", payload.task_id, payload.status)
     
     # 1. Update Task in DB
     # Ensure update_task_status returns the full task object (including session_id metadata)
@@ -158,7 +161,7 @@ async def agent_callback(payload: TaskCallback):
     )
     
     if not updated_task:
-        print("⚠️ Callback received for unknown task.")
+        logger.warning("Callback received for unknown task: %s", payload.task_id)
         return {"status": "ignored"}
 
     # 2. Extract Session ID to Resume Context
@@ -170,7 +173,7 @@ async def agent_callback(payload: TaskCallback):
         import json
         try:
              input_payload = json.loads(input_payload)
-        except:
+        except json.JSONDecodeError:
              input_payload = {}
 
     session_id = input_payload.get("session_id")
@@ -178,7 +181,7 @@ async def agent_callback(payload: TaskCallback):
     domain = updated_task.get("domain_key")
 
     if session_id and brain:
-        print(f"🔔 Waking up Session: {session_id}")
+        logger.info("Waking up session: %s", session_id)
         
         # 3. Construct System Notification
         if payload.status == "success":
@@ -200,7 +203,7 @@ async def agent_callback(payload: TaskCallback):
             # 5. Save the AI's notification to history
             await db.save_message(user_id, "assistant", ai_response["response"], session_id)
         except Exception as e:
-            print(f"⚠️ Failed to wake up brain: {e}")
+            logger.warning("Failed to wake up brain for session %s: %s", session_id, e)
         
     return {"status": "processed"}
 
@@ -209,3 +212,31 @@ async def trigger_batch(req: BatchTrigger, bg: BackgroundTasks):
     """Triggers HR Batch Jobs"""
     count = await db.process_pending_batches(req.user_id, req.batch_ids)
     return {"status": "processing", "items_count": count}
+
+
+# --- Memory Ingest (Research Agent pushes chunks here) ---
+class MemoryIngestRequest(BaseModel):
+    user_id: str
+    domain: str
+    content: str
+    metadata: dict = {}
+
+@app.post("/memory/ingest")
+async def memory_ingest(req: MemoryIngestRequest):
+    """
+    Receives research chunks from agents and stores them in semantic memory.
+    """
+    if not memory_service:
+        raise HTTPException(503, "Memory service not initialized")
+
+    try:
+        memory_id = await memory_service.save_memory(
+            user_id=req.user_id,
+            domain=req.domain,
+            content=req.content,
+            metadata=req.metadata
+        )
+        return {"status": "stored", "memory_id": memory_id}
+    except Exception as e:
+        logger.error("Memory ingest failed: %s", e, exc_info=True)
+        raise HTTPException(500, f"Failed to store memory: {e}")

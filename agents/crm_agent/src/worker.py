@@ -1,15 +1,14 @@
 import os
-import sys
+import logging
 import asyncio
 from uuid import UUID
 import json
 from celery import Task
 
-# Add parent directories to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
-
 from shared.mq import celery_app
 from shared.database import Database
+
+logger = logging.getLogger(__name__)
 
 # Initialize database
 db = Database()
@@ -57,19 +56,20 @@ class CRMWorker:
                 }
                 
             # Update task in database
-            await db.update_task(
-                UUID(task_id),
-                "completed" if result.get("status") != "failed" else "failed",
-                output_result=result
+            await db.update_task_status(
+                task_id=str(task_id),
+                status="completed" if result.get("status") != "failed" else "failed",
+                result=result
             )
             
             return result
             
         except Exception as e:
-            await db.update_task(
-                UUID(task_id),
-                "failed",
-                error_message=str(e)
+            await db.update_task_status(
+                task_id=str(task_id),
+                status="failed",
+                result=None,
+                error=str(e)
             )
             return {"error": str(e), "status": "failed"}
             
