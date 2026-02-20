@@ -143,6 +143,5 @@ class FormWorker:
 def execute_task(self: Task, task_id: str):
     """Celery task wrapper"""
     worker = FormWorker()
-    loop = asyncio.get_event_loop()
-    result = loop.run_until_complete(worker.execute(task_id))
+    result = asyncio.run(worker.execute(task_id))
     return result

@@ -276,9 +276,7 @@ krastix/
 │
 ├── shared/                  # 📦 Common Utilities
 │   ├── database.py          # Async PostgreSQL pool
-│   ├── mq.py                # Celery configuration
-│   ├── schemas.py           # Shared Pydantic models
-│   └── redis_client.py      # Redis utilities
+│   └── mq.py                # Celery configuration
 │
 └── frontend/                # 🖥️ React UI
     ├── package.json

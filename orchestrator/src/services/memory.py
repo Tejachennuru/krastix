@@ -18,7 +18,7 @@ class MemoryService:
     def __init__(self, db_pool):
         self.db_pool = db_pool
         # Initialize Ollama Embeddings
-        ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
+        ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://100.115.107.20:11434")
         self.embeddings = OllamaEmbeddings(
             model="nomic-embed-text",
             base_url=ollama_base_url

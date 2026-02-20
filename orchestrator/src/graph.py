@@ -1,6 +1,7 @@
 import os
 import logging
 import traceback
+import httpx
 from typing import TypedDict, List, Annotated, Optional, Dict, Any
 from uuid import UUID
 
@@ -34,22 +35,28 @@ class OrchestratorGraph:
         self.db_pool = db_pool
         
         # Initialize Ollama (Local Model)
-        # Using mistral-nemo (or configured model)
-        ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
-        model_name = os.getenv("OLLAMA_MODEL", "mistral-nemo")
+        # Using qwen2.5:32b (or configured model)# Connect to the LLM running on 'cogaan' via Tailscale
+        ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://100.115.107.20:11434")
+        # Ensure base URL is clean (no trailing slash) as the library handles paths
+        ollama_base_url = ollama_base_url.rstrip("/")
+        
+        model_name = os.getenv("OLLAMA_MODEL", "qwen2.5:14b-instruct-q5_K_M")
         
         logger.info(f"Initializing Orchestrator with Ollama: {model_name} at {ollama_base_url}")
         
         llm = ChatOllama(
             model=model_name,
             base_url=ollama_base_url,
-            temperature=0
+            temperature=0,
+            # Increase timeout for tool calling with large local models
+            timeout=120.0
         )
         self.llm_with_tools = llm.bind_tools([DelegateTask, QueueBatch])
         
         # Checkpointer will be initialized async
         self.checkpointer = None
         self.workflow = None
+        self._pg_cm = None  # Holds async context manager for cleanup
 
     async def initialize(self) -> None:
         """Async initialization for PostgresSaver with URL cleaning."""
@@ -60,18 +67,12 @@ class OrchestratorGraph:
             # FIX: Ensure URL is compatible with psycopg (remove +asyncpg if present)
             conn_string = raw_url.replace("postgresql+asyncpg://", "postgresql://")
 
-            # For Supabase transaction pooler (port 6543), disable prepared statements
-            # by appending to the connection string if not already present
-            if "prepare_threshold" not in conn_string:
-                separator = "&" if "?" in conn_string else "?"
-                conn_string += f"{separator}prepare_threshold=0"
-
-            # Create the checkpointer using the async context manager
-            checkpointer = await AsyncPostgresSaver.from_conn_string(conn_string).__aenter__()
+            # from_conn_string is an async context manager — enter it and keep ref for cleanup
+            self._pg_cm = AsyncPostgresSaver.from_conn_string(conn_string)
+            self.checkpointer = await self._pg_cm.__aenter__()
             
             # This creates the necessary 'checkpoints' tables if they don't exist
-            await checkpointer.setup()
-            self.checkpointer = checkpointer
+            await self.checkpointer.setup()
             logger.info("PostgresSaver connected (persistent memory)")
             
         except Exception as e:
@@ -218,12 +219,41 @@ class OrchestratorGraph:
                     }
                 )
                 
-                # Dispatch to Celery
-                celery_app.send_task(
-                    "agents.perform_task",
-                    args=[args["instruction"], state["user_id"], str(task_id)],
-                    queue=queue
-                )
+                # Research agent is a standalone HTTP service, others use Celery
+                if queue == "research_queue":
+                    # Dispatch to Research Agent via HTTP
+                    research_url = os.getenv("RESEARCH_AGENT_URL", "http://localhost:8001")
+                    try:
+                        async with httpx.AsyncClient(timeout=15.0) as client:
+                            resp = await client.post(
+                                f"{research_url}/research/run",
+                                json={
+                                    "user_id": state["user_id"],
+                                    "task_type": "GENERAL_SEARCH",
+                                    "query_or_url": args["instruction"],
+                                    "context_metadata": {
+                                        "task_id": str(task_id),
+                                        "session_id": thread_id
+                                    }
+                                }
+                            )
+                            resp.raise_for_status()
+                    except Exception as e:
+                        logger.error("Failed to dispatch to research agent: %s", e)
+                else:
+                    # Map queue to correct Celery task name
+                    task_name_map = {
+                        "crm_queue": "agents.crm_worker.execute_task",
+                        "form_queue": "agents.form_worker.execute_task",
+                    }
+                    task_name = task_name_map.get(queue, "agents.perform_task")
+                    
+                    # Dispatch to Celery
+                    celery_app.send_task(
+                        task_name,
+                        args=[str(task_id)],
+                        queue=queue
+                    )
                 
                 tool_outputs.append(
                     ToolMessage(
