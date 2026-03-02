@@ -34,6 +34,7 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - DATABASE_URL=${DATABASE_URL}
       - RESEARCH_AGENT_URL=http://research_agent:8001
+      - DOC_AGENT_URL=http://doc_agent:8002
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
       - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
@@ -126,6 +127,34 @@ services:
       - ./shared:/app/shared
     # Include agent.src.worker to register its tasks (assuming it has them)
     command: celery -A shared.mq:celery_app worker --loglevel=info -Q form_queue --include=agent.src.worker
+
+  # -----------------------------
+  # Agent 4: Document (VDU)
+  # -----------------------------
+  doc_agent:
+    build:
+      context: .
+      dockerfile: agents/doc_agent/Dockerfile
+    container_name: krastix-doc-agent
+    ports:
+      - "8002:8002"
+    restart: on-failure
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL}
+      - OLLAMA_MODEL=${OLLAMA_MODEL}
+      - VLM_MODEL=${VLM_MODEL:-qwen2.5-vl:7b}
+      - ORCHESTRATOR_URL=http://orchestrator:8000
+      - STORAGE_BUCKET=${STORAGE_BUCKET:-documents}
+    volumes:
+      - ./agents/doc_agent/src:/app/src
+      - ./shared:/app/shared
+    command: uvicorn src.main:app --host 0.0.0.0 --port 8002 --reload
 
 volumes:
   redis_data:

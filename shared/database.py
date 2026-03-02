@@ -240,5 +240,91 @@ class Database:
             # Extract count from "UPDATE X"
             return int(result.split()[-1]) if result else 0
 
+    # --- Agent Registry ---
+
+    async def get_agents_for_domain(self, domain_key: str) -> List[Dict[str, Any]]:
+        """
+        Fetch all active agents whose supported_domains contain this domain_key.
+        Uses the JSONB `?` operator (passed as $1) to check if the key exists.
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT agent_key, display_name, queue_or_url, dispatch_method,
+                       capabilities, supported_domains, version
+                FROM agent_registry
+                WHERE enabled = true AND supported_domains ? $1
+                ORDER BY display_name
+                """,
+                domain_key
+            )
+            agents = []
+            for r in rows:
+                caps = r["capabilities"]
+                if isinstance(caps, str):
+                    caps = json.loads(caps)
+                domains = r["supported_domains"]
+                if isinstance(domains, str):
+                    domains = json.loads(domains)
+                agents.append({
+                    "agent_key": r["agent_key"],
+                    "display_name": r["display_name"],
+                    "queue_or_url": r["queue_or_url"],
+                    "dispatch_method": r["dispatch_method"],
+                    "capabilities": caps,
+                    "supported_domains": domains,
+                    "version": r["version"]
+                })
+            return agents
+
+    async def get_agent(self, agent_key: str) -> Optional[Dict[str, Any]]:
+        """Fetch a single agent by its key."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT agent_key, display_name, queue_or_url, dispatch_method,
+                       capabilities, supported_domains, version, enabled
+                FROM agent_registry
+                WHERE agent_key = $1
+                """,
+                agent_key
+            )
+            if not row:
+                return None
+            caps = row["capabilities"]
+            if isinstance(caps, str):
+                caps = json.loads(caps)
+            domains = row["supported_domains"]
+            if isinstance(domains, str):
+                domains = json.loads(domains)
+            return {
+                "agent_key": row["agent_key"],
+                "display_name": row["display_name"],
+                "queue_or_url": row["queue_or_url"],
+                "dispatch_method": row["dispatch_method"],
+                "capabilities": caps,
+                "supported_domains": domains,
+                "version": row["version"],
+                "enabled": row["enabled"]
+            }
+
+    async def get_entity_schema(self, entity_type: str) -> Optional[Dict[str, Any]]:
+        """Fetch the validation schema for an entity type from entity_definitions."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT entity_type, display_name, validation_schema FROM entity_definitions WHERE entity_type = $1",
+                entity_type
+            )
+            if not row:
+                return None
+            schema = row["validation_schema"]
+            if isinstance(schema, str):
+                schema = json.loads(schema)
+            return {
+                "entity_type": row["entity_type"],
+                "display_name": row["display_name"],
+                "validation_schema": schema
+            }
+
 # Global database instance
 db = Database()

@@ -5,7 +5,7 @@
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────────┐
 │                                    KRASTIX PLATFORM                                      │
-│                        Multi-Agent AI Orchestration System                               │
+│                     Universal Agentic Engine — Multi-Agent AI Orchestration               │
 └─────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -20,20 +20,24 @@ flowchart TB
     subgraph BRAIN["🧠 Orchestrator Service :8000"]
         API[FastAPI Endpoints]
         GRAPH[LangGraph<br/>State Machine]
-        PLANNER[Planner Node]
-        DISPATCHER[Dispatcher Node]
-        MEMORY[Memory Service<br/>RAG + Embeddings]
+        PLANNER[Planner Node<br/>+ Agent Registry Injection]
+        DISPATCHER[Dispatcher Node<br/>Registry-Driven Routing]
+        MEMORY[Memory Service<br/>Namespace-Isolated RAG]
+    end
+
+    subgraph REGISTRY["📋 Agent Registry"]
+        AR[(agent_registry table)]
+        ED[(entity_definitions table)]
     end
 
     subgraph MQ["⚡ Message Queue Layer"]
         REDIS[(Redis<br/>Celery Broker)]
         CQ[crm_queue]
         FQ[form_queue]
-        RQ[research_queue]
     end
 
     subgraph AGENTS["🤖 Specialized Agents"]
-        CRM[CRM Agent<br/>Celery Worker]
+        CRM[CRM Agent<br/>Universal Entity Worker<br/>OCC + Schema Validation]
         FORM[Form Agent<br/>Celery Worker<br/>Tally Integration]
         RESEARCH[Research Agent :8001<br/>FastAPI + LangGraph<br/>Firecrawl + LinkedIn]
     end
@@ -44,9 +48,12 @@ flowchart TB
         CHECKPOINTS[LangGraph<br/>Checkpoints]
     end
 
+    subgraph LLM_LAYER["🤖 LLM Layer"]
+        OLLAMA[Ollama<br/>qwen2.5:14b-instruct]
+        EMBED[nomic-embed-text<br/>768d Embeddings]
+    end
+
     subgraph EXTERNAL["🌐 External APIs"]
-        GEMINI[Google Gemini<br/>2.0-flash]
-        EMBED[text-embedding-004]
         FIRECRAWL[Firecrawl API]
         SCRAPE[ScrapeCreators<br/>LinkedIn API]
         TALLY[Tally.so API]
@@ -59,37 +66,58 @@ flowchart TB
     API --> GRAPH
     GRAPH --> PLANNER
     PLANNER -->|Tool Call| DISPATCHER
-    PLANNER <-->|RAG Query| MEMORY
+    PLANNER <-->|Namespace-Scoped Query| MEMORY
+    PLANNER <-->|Fetch Capabilities| AR
     
-    %% Task Dispatch
-    DISPATCHER -->|Publish| REDIS
-    REDIS --> CQ & FQ & RQ
+    %% Task Dispatch (Registry-Driven)
+    DISPATCHER -->|Celery| REDIS
+    DISPATCHER -->|HTTP| RESEARCH
+    REDIS --> CQ & FQ
     
     %% Agent Consumption
     CQ --> CRM
     FQ --> FORM
-    RQ -.->|HTTP Trigger| RESEARCH
     
     %% Agent Results
-    CRM -->|Update Task| SUPABASE
+    CRM -->|Update Task + OCC| SUPABASE
     FORM -->|Update Task| SUPABASE
     RESEARCH -->|/memory/ingest| API
+    
+    %% Schema Validation
+    CRM <-->|Validate against| ED
     
     %% Data Connections
     MEMORY --> PGVECTOR
     GRAPH --> CHECKPOINTS
     PGVECTOR --> SUPABASE
     CHECKPOINTS --> SUPABASE
-    CRM --> SUPABASE
-    FORM --> SUPABASE
+    
+    %% LLM Connections
+    PLANNER --> OLLAMA
+    MEMORY --> EMBED
+    RESEARCH --> OLLAMA
     
     %% External API Connections
-    PLANNER --> GEMINI
-    MEMORY --> EMBED
     RESEARCH --> FIRECRAWL
     RESEARCH --> SCRAPE
     FORM --> TALLY
 ```
+
+---
+
+## Core Architecture Patterns
+
+### 1. Agent Registry Pattern
+Agents self-register in the `agent_registry` table with their capabilities, dispatch method, and supported domains. The orchestrator queries this at planning time to dynamically inject available agents into the LLM's system prompt, enabling domain-scoped tool routing without hardcoded mappings.
+
+### 2. Schema-on-Demand Validation
+Entity types (candidate, lead, contact, etc.) have JSON Schema definitions stored in `entity_definitions`. The CRM agent validates all payloads against these schemas before insert/update, allowing new entity types to be added via SQL without code changes.
+
+### 3. Optimistic Concurrency Control (OCC)
+Every entity row has a `version` column. Updates use `WHERE version = $expected` — if another agent modified the entity concurrently, the update affects 0 rows and a `ConcurrencyConflictError` is raised. Celery auto-retries with exponential backoff (up to 3 times).
+
+### 4. Namespace-Isolated Memory
+The `search_memory()` method accepts a mandatory `domain_key` parameter. All RAG queries are scoped to the user's current domain, preventing cross-domain context leakage. A composite index on `(user_id, domain_key)` ensures efficient filtering.
 
 ---
 
@@ -103,30 +131,30 @@ flowchart TB
 ### 2. 🧠 Orchestrator (The Brain)
 | Component | Tech | Description |
 |-----------|------|-------------|
-| **API Layer** | FastAPI | REST endpoints for `/chat`, `/health`, `/memory/ingest` |
+| **API Layer** | FastAPI | REST endpoints for `/chat`, `/health`, `/memory/ingest`, `/callbacks/task-completed` |
 | **Graph Engine** | LangGraph | Stateful workflow: Planner → Dispatcher → END |
-| **Planner Node** | Gemini 2.0 | Intent recognition, RAG context injection, tool binding |
-| **Dispatcher Node** | Celery | Publishes tasks to Redis queues |
-| **Memory Service** | pgvector | Semantic search with `text-embedding-004` (768d) |
+| **Planner Node** | Ollama (qwen2.5) | Intent recognition, RAG context + agent registry injection, tool binding |
+| **Dispatcher Node** | Registry-Driven | Routes via Celery or HTTP based on `agent_registry.dispatch_method` |
+| **Memory Service** | pgvector | Namespace-isolated semantic search with `nomic-embed-text` (768d) |
 
 ### 3. ⚡ Message Queue
 | Component | Tech | Description |
 |-----------|------|-------------|
 | **Redis** | Redis 7 Alpine | Celery broker + result backend |
-| **Queues** | Celery | `crm_queue`, `form_queue`, `research_queue` |
+| **Queues** | Celery | `crm_queue`, `form_queue` (research uses HTTP) |
 
 ### 4. 🤖 Specialized Agents
 | Agent | Type | Port | Capabilities |
 |-------|------|------|--------------|
-| **CRM Agent** | Celery Worker | - | CRUD on Candidates, Leads, Entities |
+| **CRM Agent** | Celery Worker | - | Universal entity CRUD with OCC + JSON Schema validation |
 | **Form Agent** | Celery Worker | - | Tally.so form creation/management |
 | **Research Agent** | FastAPI Service | `8001` | Web scraping, LinkedIn profiles, Site mapping |
 
 ### 5. 💾 Data Layer
 | Component | Tech | Description |
 |-----------|------|-------------|
-| **PostgreSQL** | Supabase | Primary data store |
-| **pgvector** | Extension | Vector similarity search |
+| **PostgreSQL** | Supabase | Primary data store with RLS |
+| **pgvector** | Extension | Vector similarity search (768d) |
 | **Checkpoints** | `AsyncPostgresSaver` | LangGraph conversation persistence |
 
 ---
@@ -141,26 +169,29 @@ flowchart TB
    │ POST /chat      │                  │                │              │
    │────────────────>│                  │                │              │
    │                 │                  │                │              │
-   │                 │ RAG: Search Memory                │              │
+   │                 │ 1. Query agent_registry for domain                │
    │                 │─────────────────────────────────────────────────>│
    │                 │<─────────────────────────────────────────────────│
    │                 │                  │                │              │
-   │                 │ LLM: Gemini Call │                │              │
-   │                 │ (with context)   │                │              │
+   │                 │ 2. RAG: Namespace-scoped memory search           │
+   │                 │─────────────────────────────────────────────────>│
+   │                 │<─────────────────────────────────────────────────│
    │                 │                  │                │              │
-   │                 │ Tool: DelegateTask               │              │
-   │                 │─────────────────>│                │              │
+   │                 │ 3. LLM: Ollama Call               │              │
+   │                 │ (context + agent caps)            │              │
+   │                 │                  │                │              │
+   │                 │ 4. Tool: DelegateTask             │              │
+   │                 │──(registry route)>│               │              │
    │                 │                  │ task.apply()   │              │
    │                 │                  │───────────────>│              │
    │  Response       │                  │                │              │
-   │<────────────────│                  │                │ Execute      │
+   │<────────────────│                  │                │ 5. Validate  │
+   │                 │                  │                │ schema + OCC │
    │                 │                  │                │─────────────>│
    │                 │                  │                │<─────────────│
    │                 │                  │                │              │
-   │                 │       /memory/ingest (Research)   │              │
+   │                 │ 6. /callbacks/task-completed      │              │
    │                 │<──────────────────────────────────│              │
-   │                 │─────────────────────────────────────────────────>│
-   │                 │                  │                │              │
 ```
 
 ---
@@ -168,25 +199,36 @@ flowchart TB
 ## Database Schema (Key Tables)
 
 ```
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│    profiles     │     │  domain_configs  │     │    entities     │
-├─────────────────┤     ├──────────────────┤     ├─────────────────┤
-│ id (UUID) PK    │     │ domain_key PK    │     │ id (UUID) PK    │
-│ email           │     │ display_name     │     │ user_id FK      │
-│ tier            │     │ system_prompt    │     │ entity_type FK  │
-│ credits         │     │ allowed_agents[] │     │ data (JSONB)    │
-└─────────────────┘     └──────────────────┘     │ derived_skills[]│
-                                                 └─────────────────┘
-┌─────────────────┐     ┌──────────────────┐
-│    memories     │     │   agent_tasks    │
-├─────────────────┤     ├──────────────────┤
-│ id (UUID) PK    │     │ task_id (UUID) PK│
-│ user_id FK      │     │ user_id FK       │
-│ domain_key      │     │ agent_queue      │
-│ content         │     │ status           │
-│ embedding (vec) │     │ input_payload    │
-│ metadata (JSON) │     │ output_result    │
-└─────────────────┘     └──────────────────┘
+┌─────────────────┐     ┌──────────────────┐     ┌────────────────────┐
+│    profiles     │     │  domain_configs  │     │     entities       │
+├─────────────────┤     ├──────────────────┤     ├────────────────────┤
+│ id (UUID) PK    │     │ domain_key PK    │     │ id (UUID) PK       │
+│ email           │     │ display_name     │     │ user_id FK         │
+│ tier            │     │ system_prompt    │     │ entity_type FK     │
+│ credits         │     │ allowed_agents[] │     │ data (JSONB)       │
+└─────────────────┘     └──────────────────┘     │ version (INTEGER)  │
+                                                 │ derived_skills[]   │
+                                                 └────────────────────┘
+
+┌──────────────────┐     ┌──────────────────┐     ┌────────────────────┐
+│    memories      │     │   agent_tasks    │     │  agent_registry    │
+├──────────────────┤     ├──────────────────┤     ├────────────────────┤
+│ id (UUID) PK     │     │ task_id (UUID) PK│     │ agent_key PK       │
+│ user_id FK       │     │ user_id FK       │     │ display_name       │
+│ domain_key       │     │ agent_queue      │     │ queue_or_url       │
+│ content          │     │ status           │     │ dispatch_method    │
+│ embedding (vec)  │     │ input_payload    │     │ capabilities (JSON)│
+│ metadata (JSON)  │     │ output_result    │     │ supported_domains[]│
+└──────────────────┘     └──────────────────┘     │ enabled            │
+                                                  └────────────────────┘
+┌──────────────────────┐
+│  entity_definitions  │
+├──────────────────────┤
+│ entity_type PK       │
+│ display_name         │
+│ validation_schema    │
+│ (JSON Schema)        │
+└──────────────────────┘
 ```
 
 ---
@@ -214,6 +256,13 @@ flowchart TB
               │    Supabase (External)        │
               │    PostgreSQL + pgvector      │
               └───────────────────────────────┘
+              
+                              │
+                              ▼
+              ┌───────────────────────────────┐
+              │    Ollama (Tailscale LAN)     │
+              │    100.115.107.20:11434       │
+              └───────────────────────────────┘
 ```
 
 ---
@@ -222,15 +271,17 @@ flowchart TB
 
 | Layer | Technology |
 |-------|------------|
-| **LLM** | Google Gemini 2.0-flash |
-| **Embeddings** | text-embedding-004 (768d) |
+| **LLM** | Ollama — qwen2.5:14b-instruct-q5_K_M |
+| **Embeddings** | nomic-embed-text (768d) via Ollama |
 | **Orchestration** | LangGraph + LangChain |
 | **API** | FastAPI (async) |
 | **Queue** | Celery + Redis |
-| **Database** | PostgreSQL (Supabase) |
+| **Database** | PostgreSQL (Supabase) with RLS |
 | **Vector Store** | pgvector |
 | **Frontend** | React + Vite |
 | **Containers** | Docker Compose |
+| **Schema Validation** | JSON Schema (jsonschema lib) |
+| **Concurrency** | Optimistic Concurrency Control (version column) |
 
 ---
 
@@ -239,25 +290,28 @@ flowchart TB
 ```
 krastix/
 ├── ARCHITECTURE.md          # This file
+├── README.md                # Project overview & setup guide
 ├── docker-compose.yml       # Container orchestration
-├── init.sql                 # Database schema
+├── init.sql                 # Full database schema
+├── migrations/              # Incremental SQL migrations
+│   └── 002_universal_engine.sql
 ├── .env                     # Environment variables
 │
 ├── orchestrator/            # 🧠 The Brain
 │   ├── Dockerfile
 │   ├── requirements.txt
 │   └── src/
-│       ├── main.py          # FastAPI app
-│       ├── graph.py         # LangGraph workflow
-│       ├── schemas.py       # Pydantic models + Tools
+│       ├── main.py          # FastAPI app (lifespan, /chat, /callbacks, /memory)
+│       ├── graph.py         # LangGraph workflow (Planner + Registry Dispatcher)
+│       ├── schemas.py       # Pydantic tools + registry helpers
 │       └── services/
-│           └── memory.py    # RAG + Embeddings
+│           └── memory.py    # Namespace-isolated RAG + Embeddings
 │
 ├── agents/
-│   ├── crm_agent/           # 📊 CRM Operations
+│   ├── crm_agent/           # 📊 Universal CRM Operations
 │   │   ├── Dockerfile
 │   │   ├── requirements.txt
-│   │   └── src/worker.py    # Celery tasks
+│   │   └── src/worker.py    # upsert_entity + OCC + JSON Schema validation
 │   │
 │   ├── form_agent/          # 📝 Form Management
 │   │   ├── Dockerfile
@@ -275,7 +329,7 @@ krastix/
 │           └── models.py    # Pydantic schemas
 │
 ├── shared/                  # 📦 Common Utilities
-│   ├── database.py          # Async PostgreSQL pool
+│   ├── database.py          # Async PostgreSQL pool + agent registry queries
 │   └── mq.py                # Celery configuration
 │
 └── frontend/                # 🖥️ React UI
@@ -293,11 +347,15 @@ krastix/
 # Database
 DATABASE_URL=postgresql://user:pass@host:5432/krastix_db
 
-# LLM
-GEMINI_API_KEY=AI...
+# LLM (Ollama via Tailscale)
+OLLAMA_BASE_URL=http://100.115.107.20:11434
+OLLAMA_MODEL=qwen2.5:14b-instruct-q5_K_M
 
 # Message Queue
 REDIS_URL=redis://localhost:6379/0
+
+# Research Agent
+RESEARCH_AGENT_URL=http://research_agent:8001
 
 # Research Agent APIs
 FIRECRAWL_API_KEY=fc_...
@@ -346,13 +404,16 @@ celery -A shared.mq:celery_app worker -Q form_queue --loglevel=info
 
 | Decision | Rationale |
 |----------|-----------|
-| **LangGraph over raw LangChain** | Provides stateful, resumable workflows with built-in checkpointing |
-| **Celery for CRM/Form Agents** | Fire-and-forget tasks that don't need real-time responses |
-| **FastAPI for Research Agent** | Needs HTTP interface for direct invocation + streaming results |
+| **LangGraph over raw LangChain** | Stateful, resumable workflows with built-in checkpointing |
+| **Ollama over cloud LLM** | Privacy, cost, control — runs on LAN via Tailscale |
+| **Agent Registry (DB-driven)** | Add/remove agents without code changes; domain-scoped routing |
+| **JSON Schema validation** | Entity types defined in DB; new types via SQL, not code deploys |
+| **Optimistic Concurrency** | Lock-free concurrent agent writes; Celery auto-retry on conflict |
+| **Namespace-isolated memory** | Prevents cross-domain RAG leakage; mandatory domain_key filter |
+| **Celery for CRM/Form** | Fire-and-forget tasks that don't need real-time responses |
+| **FastAPI for Research** | Needs HTTP interface for direct invocation + streaming results |
 | **pgvector over Pinecone** | Cost-effective, co-located with relational data in Supabase |
-| **Redis as Broker** | Lightweight, fast, supports both Celery and caching |
-| **Gemini 2.0-flash** | Fast inference, good tool-calling, cost-effective |
 
 ---
 
-> **Krastix** is an **Event-Driven, Multi-Agent AI System** where the Orchestrator acts as a central cognitive hub that reasons, remembers, and delegates work to specialized agents.
+> **Krastix** is a **Universal Agentic Engine** — an event-driven, multi-agent AI system where the Orchestrator acts as a central cognitive hub that reasons, remembers (per-domain), and delegates work to dynamically registered specialized agents.

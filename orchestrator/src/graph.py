@@ -15,7 +15,7 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from shared.database import db
 from shared.mq import celery_app
-from orchestrator.src.schemas import DelegateTask, QueueBatch
+from orchestrator.src.schemas import DelegateTask, QueueBatch, build_agent_capability_prompt, build_dispatch_map
 
 logger = logging.getLogger(__name__)
 
@@ -138,7 +138,8 @@ class OrchestratorGraph:
                 try:
                     results = await self.memory_service.search_memory(
                         user_id=state["user_id"], 
-                        query_text=last_human_msg.content, 
+                        query_text=last_human_msg.content,
+                        domain_key=state["domain"],
                         limit=3
                     )
                     if results:
@@ -148,9 +149,18 @@ class OrchestratorGraph:
                 except Exception as e:
                     logger.warning("Memory search failed (non-critical): %s", e)
 
+            # 2b. AGENT REGISTRY INJECTION — domain-scoped capabilities
+            agent_context = ""
+            try:
+                domain_agents = await db.get_agents_for_domain(state["domain"])
+                if domain_agents:
+                    agent_context = build_agent_capability_prompt(domain_agents)
+            except Exception as e:
+                logger.warning("Agent registry lookup failed (non-critical): %s", e)
+
             # 3. Construct Prompt
             agent_info = f"\n\nAllowed Queues: {', '.join(allowed_queues)}"
-            final_sys_prompt = sys_prompt + rag_context + agent_info
+            final_sys_prompt = sys_prompt + rag_context + agent_context + agent_info
             
             # 4. Invoke LLM
             messages = [SystemMessage(content=final_sys_prompt)] + state["messages"]
@@ -176,7 +186,7 @@ class OrchestratorGraph:
         return "respond"
 
     async def node_dispatcher(self, state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
-        """The Hands: Executes Tool Calls (DelegateTask, QueueBatch)."""
+        """The Hands: Executes Tool Calls using registry-driven dispatch."""
         last_message = state["messages"][-1]
         tool_outputs = []
         
@@ -189,6 +199,14 @@ class OrchestratorGraph:
             logger.error("Failed to fetch domain config in dispatcher: %s", e, exc_info=True)
             domain_config = None
         allowed_queues = domain_config.get("allowed_agent_queues", []) if domain_config else []
+
+        # Build registry-driven dispatch map
+        dispatch_map = {}
+        try:
+            domain_agents = await db.get_agents_for_domain(state["domain"])
+            dispatch_map = build_dispatch_map(domain_agents)
+        except Exception as e:
+            logger.warning("Registry dispatch map failed, using legacy routing: %s", e)
 
         for tool_call in last_message.tool_calls:
             tool_name = tool_call["name"]
@@ -219,41 +237,67 @@ class OrchestratorGraph:
                     }
                 )
                 
-                # Research agent is a standalone HTTP service, others use Celery
-                if queue == "research_queue":
-                    # Dispatch to Research Agent via HTTP
-                    research_url = os.getenv("RESEARCH_AGENT_URL", "http://localhost:8001")
+                # Registry-driven dispatch
+                route = dispatch_map.get(queue)
+                
+                if route and route["method"] == "http":
+                    # Generic HTTP dispatch (research agent, doc agent, etc.)
+                    target_url = queue  # queue_or_url is the HTTP base URL
+                    endpoint = route.get("http_endpoint", "/research/run")
                     try:
                         async with httpx.AsyncClient(timeout=15.0) as client:
                             resp = await client.post(
-                                f"{research_url}/research/run",
+                                f"{target_url}{endpoint}",
                                 json={
                                     "user_id": state["user_id"],
                                     "task_type": "GENERAL_SEARCH",
                                     "query_or_url": args["instruction"],
+                                    "instruction": args["instruction"],
                                     "context_metadata": {
                                         "task_id": str(task_id),
-                                        "session_id": thread_id
+                                        "session_id": thread_id,
+                                        "domain_key": state["domain"]
                                     }
                                 }
                             )
                             resp.raise_for_status()
                     except Exception as e:
-                        logger.error("Failed to dispatch to research agent: %s", e)
-                else:
-                    # Map queue to correct Celery task name
-                    task_name_map = {
-                        "crm_queue": "agents.crm_worker.execute_task",
-                        "form_queue": "agents.form_worker.execute_task",
-                    }
-                    task_name = task_name_map.get(queue, "agents.perform_task")
-                    
-                    # Dispatch to Celery
+                        logger.error("HTTP dispatch to %s%s failed: %s", target_url, endpoint, e)
+                elif route and route["method"] == "celery":
+                    # Celery dispatch using registry task name
                     celery_app.send_task(
-                        task_name,
+                        route["task_name"],
                         args=[str(task_id)],
                         queue=queue
                     )
+                else:
+                    # Legacy fallback: use hardcoded mapping
+                    if queue == "research_queue":
+                        research_url = os.getenv("RESEARCH_AGENT_URL", "http://localhost:8001")
+                        try:
+                            async with httpx.AsyncClient(timeout=15.0) as client:
+                                resp = await client.post(
+                                    f"{research_url}/research/run",
+                                    json={
+                                        "user_id": state["user_id"],
+                                        "task_type": "GENERAL_SEARCH",
+                                        "query_or_url": args["instruction"],
+                                        "context_metadata": {
+                                            "task_id": str(task_id),
+                                            "session_id": thread_id
+                                        }
+                                    }
+                                )
+                                resp.raise_for_status()
+                        except Exception as e:
+                            logger.error("Legacy HTTP dispatch to research agent failed: %s", e)
+                    else:
+                        legacy_map = {
+                            "crm_queue": "agents.crm_worker.execute_task",
+                            "form_queue": "agents.form_worker.execute_task",
+                        }
+                        task_name = legacy_map.get(queue, "agents.perform_task")
+                        celery_app.send_task(task_name, args=[str(task_id)], queue=queue)
                 
                 tool_outputs.append(
                     ToolMessage(

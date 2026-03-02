@@ -56,8 +56,15 @@ class MemoryService:
             logger.error("Save memory failed: %s", e, exc_info=True)
             raise
 
-    async def search_memory(self, user_id: str, query_text: str, filter_metadata: Optional[Dict[str, Any]] = None, limit: int = 5) -> List[Dict[str, Any]]:
-        """Context-Aware Semantic Search using metadata filtering."""
+    async def search_memory(self, user_id: str, query_text: str, 
+                           domain_key: Optional[str] = None,
+                           filter_metadata: Optional[Dict[str, Any]] = None, 
+                           limit: int = 5) -> List[Dict[str, Any]]:
+        """
+        Namespace-isolated semantic search.
+        When domain_key is provided, results are scoped to that domain only.
+        Metadata filters are applied on top of the domain scope.
+        """
         try:
             valid_user_id = UUID(user_id)
             query_vector = await self.get_embedding(query_text)
@@ -69,6 +76,12 @@ class MemoryService:
             where_clauses = ["user_id = $2"]
             args = [str(query_vector), valid_user_id]
             arg_counter = 3
+
+            # Namespace isolation: filter by domain_key
+            if domain_key:
+                where_clauses.append(f"domain_key = ${arg_counter}")
+                args.append(domain_key)
+                arg_counter += 1
 
             if filter_metadata:
                 for key, value in filter_metadata.items():
@@ -84,7 +97,7 @@ class MemoryService:
             
             # $arg_counter will be the limit
             full_sql = f"""
-                SELECT content, metadata, 1 - (embedding <=> $1::vector) as similarity
+                SELECT content, metadata, domain_key, 1 - (embedding <=> $1::vector) as similarity
                 FROM memories
                 WHERE {where_sql}
                 ORDER BY embedding <=> $1::vector 
