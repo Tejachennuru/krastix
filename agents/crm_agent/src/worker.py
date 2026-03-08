@@ -8,6 +8,7 @@ import jsonschema
 
 from shared.mq import celery_app
 from shared.database import Database
+from shared.callbacks import notify_task_completed
 
 logger = logging.getLogger(__name__)
 
@@ -76,10 +77,19 @@ class CRMWorker:
                 }
 
             # Update task in database
+            final_status = "completed" if result.get("status") != "failed" else "failed"
             await db.update_task_status(
                 task_id=str(task_id),
-                status="completed" if result.get("status") != "failed" else "failed",
+                status=final_status,
                 result=result
+            )
+
+            # Notify orchestrator (replaces fire-and-forget with guaranteed delivery)
+            await notify_task_completed(
+                task_id=str(task_id),
+                status="success" if final_status == "completed" else "failed",
+                result=result,
+                error=result.get("error"),
             )
 
             return result
@@ -92,6 +102,11 @@ class CRMWorker:
                 result=None,
                 error=f"Concurrency conflict: {e}"
             )
+            await notify_task_completed(
+                task_id=str(task_id),
+                status="failed",
+                error=f"Concurrency conflict: {e}",
+            )
             # Re-raise to trigger Celery retry
             raise
 
@@ -102,6 +117,11 @@ class CRMWorker:
                 status="failed",
                 result=None,
                 error=str(e)
+            )
+            await notify_task_completed(
+                task_id=str(task_id),
+                status="failed",
+                error=str(e),
             )
             return {"error": str(e), "status": "failed"}
 

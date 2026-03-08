@@ -67,6 +67,7 @@ services:
       - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL}
       - OLLAMA_MODEL=${OLLAMA_MODEL}
+      - ORCHESTRATOR_URL=http://orchestrator:8000
     depends_on:
       redis:
         condition: service_healthy
@@ -119,6 +120,7 @@ services:
       - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL}
       - OLLAMA_MODEL=${OLLAMA_MODEL}
+      - ORCHESTRATOR_URL=http://orchestrator:8000
     depends_on:
       redis:
         condition: service_healthy
@@ -149,6 +151,8 @@ services:
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL}
       - OLLAMA_MODEL=${OLLAMA_MODEL}
       - VLM_MODEL=${VLM_MODEL:-qwen2.5-vl:7b}
+      - GROQ_API_KEY=${GROQ_API_KEY:-${GROK_API_KEY:-}}
+      - GROQ_VISION_MODEL=${GROQ_VISION_MODEL:-llama-3.2-90b-vision-preview}
       - ORCHESTRATOR_URL=http://orchestrator:8000
       - STORAGE_BUCKET=${STORAGE_BUCKET:-documents}
     volumes:

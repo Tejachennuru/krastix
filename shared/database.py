@@ -326,5 +326,41 @@ class Database:
                 "validation_schema": schema
             }
 
+    # --- Stale Task Detection (Task Watcher) ---
+
+    async def get_stale_tasks(self, stale_minutes: int = 10) -> List[Dict[str, Any]]:
+        """
+        Find tasks stuck in 'pending' or 'processing' for longer
+        than ``stale_minutes``.  Used by the orchestrator's task watcher
+        to resume forgotten tasks.
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT task_id, user_id, domain_key, agent_queue, status,
+                       input_payload, output_result, error_message,
+                       created_at, completed_at
+                FROM agent_tasks
+                WHERE status IN ('pending', 'processing')
+                  AND created_at < NOW() - INTERVAL '1 minute' * $1
+                ORDER BY created_at ASC
+                LIMIT 50
+                """,
+                stale_minutes,
+            )
+            return [dict(r) for r in rows]
+
+    async def mark_task_stale(self, task_id: UUID) -> None:
+        """Mark a task as 'stale' so it doesn't get picked up again."""
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE agent_tasks
+                SET status = 'stale', error_message = 'Marked stale by task watcher'
+                WHERE task_id = $1 AND status IN ('pending', 'processing')
+                """,
+                task_id,
+            )
+
 # Global database instance
 db = Database()

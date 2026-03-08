@@ -1,10 +1,15 @@
 """
 Stage 4 — Vision-Audit (Reflect-Refine).
 
-A secondary VLM pass (the *Refiner*) compares the extracted JSON
+A secondary LLM pass (the *Refiner*) compares the extracted JSON
 against the original page image.  If discrepancies are found the agent
 performs a **Foveal Re-scan** — re-processing only the offending
 bounding box at 2× resolution — then patches the extraction result.
+
+LLM Routing:
+  - Vision audit (image comparison) → Groq (fast cloud vision)
+  - Foveal re-scan (cropped region) → Groq (fast cloud vision)
+  - Text-only refinement            → Local Ollama qwen2.5:14b (free)
 """
 
 import json
@@ -13,30 +18,25 @@ import re
 from typing import Any, Dict, List, Optional
 
 from langchain_core.messages import HumanMessage
-from langchain_ollama import ChatOllama
 
-from src.config import OLLAMA_BASE_URL, VLM_MODEL, CONFIDENCE_THRESHOLD
+from src.config import CONFIDENCE_THRESHOLD
+from src.llm_router import get_vision_llm, get_text_llm
 
 logger = logging.getLogger(__name__)
 
 
 # ────────────────────────────────────────────────────────────────────
-# Refiner VLM (reuses the same model, could be swapped)
+# LLM Accessors — routed via llm_router
 # ────────────────────────────────────────────────────────────────────
 
-_refiner: Optional[ChatOllama] = None
+def get_refiner():
+    """Return the vision LLM for audit (image comparison)."""
+    return get_vision_llm()
 
 
-def get_refiner() -> ChatOllama:
-    global _refiner
-    if _refiner is None:
-        _refiner = ChatOllama(
-            model=VLM_MODEL,
-            base_url=OLLAMA_BASE_URL,
-            temperature=0,
-            timeout=180.0,
-        )
-    return _refiner
+def get_text_refiner():
+    """Return the text LLM for text-only refinement."""
+    return get_text_llm()
 
 
 # ────────────────────────────────────────────────────────────────────

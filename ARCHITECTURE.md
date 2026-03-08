@@ -1,4 +1,4 @@
-# 🏗️ Krastix System Architecture
+# Krastix System Architecture
 
 ## High-Level Overview
 
@@ -6,6 +6,9 @@
 ┌─────────────────────────────────────────────────────────────────────────────────────────┐
 │                                    KRASTIX PLATFORM                                      │
 │                     Universal Agentic Engine — Multi-Agent AI Orchestration               │
+│                                                                                          │
+│  Dual-LLM Strategy:  Groq (cloud/vision/fast) + Ollama qwen2.5:14b (local/text/free)    │
+│  Real-Time SSE Streaming  ·  Callback + Task Watcher Reliability  ·  Registry-Driven     │
 └─────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -13,54 +16,57 @@
 
 ```mermaid
 flowchart TB
-    subgraph CLIENT["🖥️ Client Layer"]
-        FE[React Frontend<br/>Vite + JSX]
+    subgraph CLIENT["Client Layer"]
+        FE[React Frontend<br/>Vite + SSE Streaming]
     end
 
-    subgraph BRAIN["🧠 Orchestrator Service :8000"]
-        API[FastAPI Endpoints]
+    subgraph BRAIN["Orchestrator Service :8000"]
+        API[FastAPI Endpoints<br/>+ SSE /chat/stream]
         GRAPH[LangGraph<br/>State Machine]
         PLANNER[Planner Node<br/>+ Agent Registry Injection]
         DISPATCHER[Dispatcher Node<br/>Registry-Driven Routing]
         MEMORY[Memory Service<br/>Namespace-Isolated RAG]
+        WATCHER[Task Watcher<br/>Stale Task Safety Net]
     end
 
-    subgraph REGISTRY["📋 Agent Registry"]
+    subgraph REGISTRY["Agent Registry"]
         AR[(agent_registry table)]
         ED[(entity_definitions table)]
     end
 
-    subgraph MQ["⚡ Message Queue Layer"]
+    subgraph MQ["Message Queue Layer"]
         REDIS[(Redis<br/>Celery Broker)]
         CQ[crm_queue]
         FQ[form_queue]
     end
 
-    subgraph AGENTS["🤖 Specialized Agents"]
+    subgraph AGENTS["Specialized Agents"]
         CRM[CRM Agent<br/>Universal Entity Worker<br/>OCC + Schema Validation]
         FORM[Form Agent<br/>Celery Worker<br/>Tally Integration]
         RESEARCH[Research Agent :8001<br/>FastAPI + LangGraph<br/>Firecrawl + LinkedIn]
+        DOC[Document Agent :8002<br/>VDU Pipeline<br/>Groq Vision + Ollama Text]
     end
 
-    subgraph DATA["💾 Data Layer"]
+    subgraph DATA["Data Layer"]
         SUPABASE[(PostgreSQL<br/>Supabase)]
         PGVECTOR[pgvector<br/>Semantic Memory]
         CHECKPOINTS[LangGraph<br/>Checkpoints]
     end
 
-    subgraph LLM_LAYER["🤖 LLM Layer"]
-        OLLAMA[Ollama<br/>qwen2.5:14b-instruct]
+    subgraph LLM_LAYER["Dual-LLM Layer"]
+        GROQ[Groq API<br/>llama-3.2-90b-vision<br/>Cloud · Fast · Multimodal]
+        OLLAMA[Ollama<br/>qwen2.5:14b-instruct<br/>Local · Free · Text]
         EMBED[nomic-embed-text<br/>768d Embeddings]
     end
 
-    subgraph EXTERNAL["🌐 External APIs"]
+    subgraph EXTERNAL["External APIs"]
         FIRECRAWL[Firecrawl API]
         SCRAPE[ScrapeCreators<br/>LinkedIn API]
         TALLY[Tally.so API]
     end
 
-    %% Client Flow
-    FE -->|HTTP REST| API
+    %% Client Flow — SSE streaming
+    FE -->|SSE Stream| API
     
     %% Brain Internal Flow
     API --> GRAPH
@@ -68,23 +74,28 @@ flowchart TB
     PLANNER -->|Tool Call| DISPATCHER
     PLANNER <-->|Namespace-Scoped Query| MEMORY
     PLANNER <-->|Fetch Capabilities| AR
+    WATCHER -->|Check stale tasks| SUPABASE
+    WATCHER -->|Notify session| GRAPH
     
     %% Task Dispatch (Registry-Driven)
     DISPATCHER -->|Celery| REDIS
     DISPATCHER -->|HTTP| RESEARCH
+    DISPATCHER -->|HTTP| DOC
     REDIS --> CQ & FQ
     
     %% Agent Consumption
     CQ --> CRM
     FQ --> FORM
     
-    %% Agent Results
-    CRM -->|Update Task + OCC| SUPABASE
-    FORM -->|Update Task| SUPABASE
-    RESEARCH -->|/memory/ingest| API
+    %% Agent Results — ALL agents now callback
+    CRM -->|callback| API
+    FORM -->|callback| API
+    RESEARCH -->|callback + /memory/ingest| API
+    DOC -->|callback + /memory/ingest| API
     
     %% Schema Validation
     CRM <-->|Validate against| ED
+    DOC <-->|Fetch schema| ED
     
     %% Data Connections
     MEMORY --> PGVECTOR
@@ -92,10 +103,12 @@ flowchart TB
     PGVECTOR --> SUPABASE
     CHECKPOINTS --> SUPABASE
     
-    %% LLM Connections
+    %% LLM Connections — Dual strategy
     PLANNER --> OLLAMA
     MEMORY --> EMBED
     RESEARCH --> OLLAMA
+    DOC -->|Vision extraction| GROQ
+    DOC -->|Text audit/refine| OLLAMA
     
     %% External API Connections
     RESEARCH --> FIRECRAWL
@@ -110,13 +123,48 @@ flowchart TB
 ### 1. Agent Registry Pattern
 Agents self-register in the `agent_registry` table with their capabilities, dispatch method, and supported domains. The orchestrator queries this at planning time to dynamically inject available agents into the LLM's system prompt, enabling domain-scoped tool routing without hardcoded mappings.
 
-### 2. Schema-on-Demand Validation
+### 2. Dual-LLM Routing Strategy
+The system uses two LLM providers strategically for speed and cost:
+
+| Task Type | Provider | Model | Rationale |
+|-----------|----------|-------|-----------|
+| **Vision extraction** (document pages) | Groq Cloud | llama-3.2-90b-vision-preview | Fast cloud inference, multimodal capability |
+| **Text analysis** (audit, refinement) | Local Ollama | qwen2.5:14b-instruct | Free, no API cost, good for structured text tasks |
+| **Orchestrator planning** | Local Ollama | qwen2.5:14b-instruct | Reasoning + tool calling |
+| **Embeddings** | Local Ollama | nomic-embed-text | 768d vectors, co-located |
+
+Fallback chain: Groq Vision → local Ollama VLM → error. Text tasks always use local Ollama first.
+
+### 3. SSE Token Streaming
+The orchestrator exposes `POST /api/v1/chat/stream` which uses LangGraph's `astream_events(v2)` to deliver LLM tokens to the frontend in real-time via Server-Sent Events. Event types: `token`, `tool_start`, `tool_result`, `done`, `error`. The frontend falls back to the non-streaming `/api/v1/chat` endpoint if SSE fails.
+
+### 4. Reliable Task Delivery (Callback + Task Watcher)
+The original fire-and-forget Celery pattern had a critical gap: if an agent crashed or the callback HTTP request failed, tasks were silently lost. The new system uses a **dual safety net**:
+
+1. **Primary: Agent Callbacks** — Every agent (Celery workers + HTTP services) calls `POST /callbacks/task-completed` after completing or failing a task. A shared `callbacks.py` utility standardises this.
+2. **Safety Net: Task Watcher** — A background coroutine in the orchestrator checks for tasks stuck in `pending`/`processing` for >10 minutes, marks them `stale`, and notifies the user's session.
+
+```
+Agent completes work
+    │
+    ├─→ db.update_task_status()     (always happens first)
+    │
+    ├─→ POST /callbacks/task-completed  (primary delivery)
+    │       │
+    │       └─→ Orchestrator wakes up session, notifies user
+    │
+    └─→ (if callback fails)
+            │
+            └─→ Task Watcher picks up stale task → notifies user
+```
+
+### 5. Schema-on-Demand Validation
 Entity types (candidate, lead, contact, etc.) have JSON Schema definitions stored in `entity_definitions`. The CRM agent validates all payloads against these schemas before insert/update, allowing new entity types to be added via SQL without code changes.
 
-### 3. Optimistic Concurrency Control (OCC)
+### 6. Optimistic Concurrency Control (OCC)
 Every entity row has a `version` column. Updates use `WHERE version = $expected` — if another agent modified the entity concurrently, the update affects 0 rows and a `ConcurrencyConflictError` is raised. Celery auto-retries with exponential backoff (up to 3 times).
 
-### 4. Namespace-Isolated Memory
+### 7. Namespace-Isolated Memory
 The `search_memory()` method accepts a mandatory `domain_key` parameter. All RAG queries are scoped to the user's current domain, preventing cross-domain context leakage. A composite index on `(user_id, domain_key)` ensures efficient filtering.
 
 ---
@@ -126,16 +174,17 @@ The `search_memory()` method accepts a mandatory `domain_key` parameter. All RAG
 ### 1. 🖥️ Client Layer
 | Component | Tech | Port | Description |
 |-----------|------|------|-------------|
-| **Frontend** | React + Vite | `5173` | Chat UI, Domain selector, Task status polling |
+| **Frontend** | React + Vite | `5173` | Chat UI with SSE streaming, stop button, tool delegation indicators |
 
 ### 2. 🧠 Orchestrator (The Brain)
 | Component | Tech | Description |
 |-----------|------|-------------|
-| **API Layer** | FastAPI | REST endpoints for `/chat`, `/health`, `/memory/ingest`, `/callbacks/task-completed` |
+| **API Layer** | FastAPI | `/chat`, `/chat/stream` (SSE), `/health`, `/memory/ingest`, `/callbacks/task-completed` |
 | **Graph Engine** | LangGraph | Stateful workflow: Planner → Dispatcher → END |
 | **Planner Node** | Ollama (qwen2.5) | Intent recognition, RAG context + agent registry injection, tool binding |
 | **Dispatcher Node** | Registry-Driven | Routes via Celery or HTTP based on `agent_registry.dispatch_method` |
 | **Memory Service** | pgvector | Namespace-isolated semantic search with `nomic-embed-text` (768d) |
+| **Task Watcher** | asyncio | Background coroutine (60s poll) — catches stale tasks >10 min |
 
 ### 3. ⚡ Message Queue
 | Component | Tech | Description |
@@ -149,6 +198,7 @@ The `search_memory()` method accepts a mandatory `domain_key` parameter. All RAG
 | **CRM Agent** | Celery Worker | - | Universal entity CRUD with OCC + JSON Schema validation |
 | **Form Agent** | Celery Worker | - | Tally.so form creation/management |
 | **Research Agent** | FastAPI Service | `8001` | Web scraping, LinkedIn profiles, Site mapping |
+| **Doc Agent** | FastAPI Service | `8002` | PDF/image extraction via LangGraph VDU pipeline (Groq Vision + Ollama) |
 
 ### 5. 💾 Data Layer
 | Component | Tech | Description |
@@ -166,7 +216,7 @@ The `search_memory()` method accepts a mandatory `domain_key` parameter. All RAG
 │ User │      │ Orchestrator│      │  Redis   │      │ Agent │      │Supabase│
 └──┬───┘      └──────┬──────┘      └────┬─────┘      └───┬───┘      └───┬────┘
    │                 │                  │                │              │
-   │ POST /chat      │                  │                │              │
+   │ POST /chat/stream (SSE)            │                │              │
    │────────────────>│                  │                │              │
    │                 │                  │                │              │
    │                 │ 1. Query agent_registry for domain                │
@@ -177,21 +227,23 @@ The `search_memory()` method accepts a mandatory `domain_key` parameter. All RAG
    │                 │─────────────────────────────────────────────────>│
    │                 │<─────────────────────────────────────────────────│
    │                 │                  │                │              │
-   │                 │ 3. LLM: Ollama Call               │              │
-   │                 │ (context + agent caps)            │              │
+   │  SSE: tokens    │ 3. LLM: Ollama Call (streamed)    │              │
+   │<·····(streaming)│ (context + agent caps)            │              │
    │                 │                  │                │              │
-   │                 │ 4. Tool: DelegateTask             │              │
-   │                 │──(registry route)>│               │              │
+   │  SSE: tool_start│ 4. Tool: DelegateTask             │              │
+   │<················│──(registry route)>│               │              │
    │                 │                  │ task.apply()   │              │
-   │                 │                  │───────────────>│              │
-   │  Response       │                  │                │              │
+   │  SSE: done      │                  │───────────────>│              │
    │<────────────────│                  │                │ 5. Validate  │
    │                 │                  │                │ schema + OCC │
    │                 │                  │                │─────────────>│
    │                 │                  │                │<─────────────│
    │                 │                  │                │              │
-   │                 │ 6. /callbacks/task-completed      │              │
+   │                 │ 6. POST /callbacks/task-completed │              │
    │                 │<──────────────────────────────────│              │
+   │                 │                  │                │              │
+   │                 │ 7. Task Watcher (safety net, 60s poll)           │
+   │                 │──────────── stale task scan ────────────────────>│
 ```
 
 ---
@@ -244,25 +296,20 @@ The `search_memory()` method accepts a mandatory `domain_key` parameter. All RAG
 │  │   :6379      │  │    :8000     │  │       :8001          │  │
 │  └──────────────┘  └──────────────┘  └──────────────────────┘  │
 │                                                                 │
-│  ┌──────────────┐  ┌──────────────┐                            │
-│  │  crm_agent   │  │  form_agent  │   (Celery Workers)         │
-│  │  crm_queue   │  │  form_queue  │                            │
-│  └──────────────┘  └──────────────┘                            │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐  │
+│  │  crm_agent   │  │  form_agent  │  │    doc_agent         │  │
+│  │  crm_queue   │  │  form_queue  │  │       :8002          │  │
+│  └──────────────┘  └──────────────┘  └──────────────────────┘  │
+│   (Celery Workers)                    (FastAPI Service)         │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
                               │
-                              ▼
-              ┌───────────────────────────────┐
-              │    Supabase (External)        │
-              │    PostgreSQL + pgvector      │
-              └───────────────────────────────┘
-              
-                              │
-                              ▼
-              ┌───────────────────────────────┐
-              │    Ollama (Tailscale LAN)     │
-              │    100.115.107.20:11434       │
-              └───────────────────────────────┘
+              ┌───────────────┼───────────────┐
+              ▼               ▼               ▼
+┌───────────────────┐ ┌─────────────┐ ┌──────────────────┐
+│ Supabase          │ │ Ollama (LAN)│ │   Groq Cloud API │
+│ PostgreSQL+pgvec  │ │ :11434      │ │  (Vision + Text) │
+└───────────────────┘ └─────────────┘ └──────────────────┘
 ```
 
 ---
@@ -271,17 +318,20 @@ The `search_memory()` method accepts a mandatory `domain_key` parameter. All RAG
 
 | Layer | Technology |
 |-------|------------|
-| **LLM** | Ollama — qwen2.5:14b-instruct-q5_K_M |
+| **LLM (Text)** | Ollama — qwen2.5:14b-instruct-q5_K_M (local, free) |
+| **LLM (Vision)** | Groq — llama-3.2-90b-vision-preview (cloud, fast) |
+| **LLM (Text-fast)** | Groq — llama-3.3-70b-versatile (cloud fallback) |
 | **Embeddings** | nomic-embed-text (768d) via Ollama |
 | **Orchestration** | LangGraph + LangChain |
-| **API** | FastAPI (async) |
+| **API** | FastAPI (async) + SSE streaming |
 | **Queue** | Celery + Redis |
 | **Database** | PostgreSQL (Supabase) with RLS |
 | **Vector Store** | pgvector |
-| **Frontend** | React + Vite |
-| **Containers** | Docker Compose |
+| **Frontend** | React + Vite (SSE consumer) |
+| **Containers** | Docker Compose (6 services) |
 | **Schema Validation** | JSON Schema (jsonschema lib) |
 | **Concurrency** | Optimistic Concurrency Control (version column) |
+| **Reliability** | Agent callbacks + Task Watcher background coroutine |
 
 ---
 
@@ -301,8 +351,8 @@ krastix/
 │   ├── Dockerfile
 │   ├── requirements.txt
 │   └── src/
-│       ├── main.py          # FastAPI app (lifespan, /chat, /callbacks, /memory)
-│       ├── graph.py         # LangGraph workflow (Planner + Registry Dispatcher)
+│       ├── main.py          # FastAPI app (/chat, /chat/stream SSE, /callbacks, Task Watcher)
+│       ├── graph.py         # LangGraph workflow (Planner + Dispatcher + stream_message)
 │       ├── schemas.py       # Pydantic tools + registry helpers
 │       └── services/
 │           └── memory.py    # Namespace-isolated RAG + Embeddings
@@ -318,18 +368,35 @@ krastix/
 │   │   ├── requirements.txt
 │   │   └── src/worker.py    # Tally.so integration
 │   │
-│   └── research_agent/      # 🔍 Web Research
+│   ├── research_agent/      # 🔍 Web Research
+│   │   ├── Dockerfile
+│   │   ├── requirements.txt
+│   │   ├── README.md
+│   │   └── src/
+│   │       ├── main.py      # FastAPI app + callback on completion
+│   │       ├── graph.py     # LangGraph workflow
+│   │       ├── tools.py     # Firecrawl + LinkedIn
+│   │       └── models.py    # Pydantic schemas
+│   │
+│   └── doc_agent/           # 📄 Document Processing (VDU)
 │       ├── Dockerfile
 │       ├── requirements.txt
-│       ├── README.md
 │       └── src/
 │           ├── main.py      # FastAPI app
-│           ├── graph.py     # LangGraph workflow
-│           ├── tools.py     # Firecrawl + LinkedIn
-│           └── models.py    # Pydantic schemas
+│           ├── config.py    # Dual-LLM config (Groq + Ollama)
+│           ├── llm_router.py # LLM factory (vision → Groq, text → Ollama)
+│           ├── graph.py     # LangGraph pipeline (preprocess→extract→ground→audit)
+│           ├── models.py    # Pydantic schemas + PipelineState
+│           ├── storage.py   # Supabase storage client
+│           └── pipeline/
+│               ├── preprocessing.py  # PDF→images, foveal crop
+│               ├── extraction.py     # VLM page extraction (Groq Vision)
+│               ├── grounding.py      # Schema mapping + chunking
+│               └── audit.py          # Vision audit + text refinement
 │
 ├── shared/                  # 📦 Common Utilities
-│   ├── database.py          # Async PostgreSQL pool + agent registry queries
+│   ├── database.py          # Async PostgreSQL pool + stale task queries
+│   ├── callbacks.py         # Agent → Orchestrator callback utility (httpx)
 │   └── mq.py                # Celery configuration
 │
 └── frontend/                # 🖥️ React UI
@@ -347,15 +414,22 @@ krastix/
 # Database
 DATABASE_URL=postgresql://user:pass@host:5432/krastix_db
 
-# LLM (Ollama via Tailscale)
+# LLM — Local (Ollama via Tailscale)
 OLLAMA_BASE_URL=http://100.115.107.20:11434
 OLLAMA_MODEL=qwen2.5:14b-instruct-q5_K_M
+
+# LLM — Cloud (Groq)
+GROQ_API_KEY=gsk_...           # Vision + fast text inference
+GROQ_VISION_MODEL=llama-3.2-90b-vision-preview
+GROQ_TEXT_MODEL=llama-3.3-70b-versatile
 
 # Message Queue
 REDIS_URL=redis://localhost:6379/0
 
-# Research Agent
+# Agent URLs
 RESEARCH_AGENT_URL=http://research_agent:8001
+DOC_AGENT_URL=http://doc_agent:8002
+ORCHESTRATOR_URL=http://orchestrator:8000  # For agent callbacks
 
 # Research Agent APIs
 FIRECRAWL_API_KEY=fc_...
@@ -405,13 +479,15 @@ celery -A shared.mq:celery_app worker -Q form_queue --loglevel=info
 | Decision | Rationale |
 |----------|-----------|
 | **LangGraph over raw LangChain** | Stateful, resumable workflows with built-in checkpointing |
-| **Ollama over cloud LLM** | Privacy, cost, control — runs on LAN via Tailscale |
+| **Dual-LLM (Groq + Ollama)** | Groq for fast vision/cloud tasks; Ollama for free local text inference |
+| **SSE over WebSocket** | Simpler, HTTP-native, works through proxies; no bidirectional needed |
 | **Agent Registry (DB-driven)** | Add/remove agents without code changes; domain-scoped routing |
+| **Callback + Task Watcher** | Primary HTTP callback for speed; background poll as safety net |
 | **JSON Schema validation** | Entity types defined in DB; new types via SQL, not code deploys |
 | **Optimistic Concurrency** | Lock-free concurrent agent writes; Celery auto-retry on conflict |
 | **Namespace-isolated memory** | Prevents cross-domain RAG leakage; mandatory domain_key filter |
-| **Celery for CRM/Form** | Fire-and-forget tasks that don't need real-time responses |
-| **FastAPI for Research** | Needs HTTP interface for direct invocation + streaming results |
+| **Celery for CRM/Form** | Background tasks with reliable callback on completion |
+| **FastAPI for Research/Doc** | Needs HTTP interface for direct invocation + streaming results |
 | **pgvector over Pinecone** | Cost-effective, co-located with relational data in Supabase |
 
 ---

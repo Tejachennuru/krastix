@@ -1,8 +1,9 @@
 """
-Stage 2 — Multimodal Extraction (Qwen 2.5-VL / Qwen 3.0-VL).
+Stage 2 — Multimodal Extraction (Groq Vision + Local Ollama).
 
-Sends each page image to the VLM via Ollama for full-page extraction
-and optional schema-guided field extraction.
+Sends each page image to the best available vision LLM:
+  - Primary: Groq API (llama-3.2-90b-vision-preview) — fast cloud
+  - Fallback: Local Ollama VLM (if available)
 
 Prompting Strategy
 ------------------
@@ -19,33 +20,19 @@ import re
 from typing import Any, Dict, List, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_ollama import ChatOllama
 
-from src.config import OLLAMA_BASE_URL, VLM_MODEL
+from src.llm_router import get_vision_llm, get_text_llm
 
 logger = logging.getLogger(__name__)
 
 
 # ────────────────────────────────────────────────────────────────────
-# VLM Client (lazy singleton)
+# VLM Client — uses the LLM router (Groq primary, Ollama fallback)
 # ────────────────────────────────────────────────────────────────────
 
-_vlm: Optional[ChatOllama] = None
-
-
-def get_vlm() -> ChatOllama:
-    """Return a shared ChatOllama instance for the vision-language model."""
-    global _vlm
-    if _vlm is None:
-        logger.info("Initialising VLM: %s @ %s", VLM_MODEL, OLLAMA_BASE_URL)
-        _vlm = ChatOllama(
-            model=VLM_MODEL,
-            base_url=OLLAMA_BASE_URL,
-            temperature=0,
-            timeout=180.0,
-            # format="json",  # Enable if model supports constrained JSON
-        )
-    return _vlm
+def get_vlm():
+    """Return the best available vision-language model via the router."""
+    return get_vision_llm()
 
 
 # ────────────────────────────────────────────────────────────────────

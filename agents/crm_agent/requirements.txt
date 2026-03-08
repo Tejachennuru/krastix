@@ -3,5 +3,6 @@ redis==5.0.1
 pydantic>=2.6.0
 python-dotenv==1.0.0
 requests
+httpx
 asyncpg==0.29.0
 jsonschema>=4.21.0

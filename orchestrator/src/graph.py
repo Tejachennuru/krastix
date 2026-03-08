@@ -356,3 +356,88 @@ class OrchestratorGraph:
             "response": response_text,
             "task_id": final_state.get("current_task_id")
         }
+
+    async def stream_message(self, user_id: str, domain: str, message: str, thread_id: str, role: str = "user"):
+        """
+        Stream the graph execution, yielding SSE events as tokens arrive.
+        
+        Yields dicts with event types:
+          {"event": "token",     "data": "partial text"}
+          {"event": "tool_call", "data": {"tool": "DelegateTask", "args": {...}}}
+          {"event": "tool_result", "data": "Task dispatched..."}
+          {"event": "done",      "data": {"response": "full text", "task_id": "..."}}
+          {"event": "error",     "data": "error message"}
+        """
+        if not self.workflow:
+            yield {"event": "error", "data": "Graph not initialized"}
+            return
+
+        config = {"configurable": {"thread_id": thread_id}}
+
+        if role == "system":
+            input_message = SystemMessage(content=message)
+        else:
+            input_message = HumanMessage(content=message)
+
+        initial_state = {
+            "user_id": user_id,
+            "domain": domain,
+            "messages": [input_message]
+        }
+
+        full_response = ""
+        task_id = None
+
+        try:
+            async for event in self.workflow.astream_events(
+                initial_state, config=config, version="v2"
+            ):
+                kind = event.get("event", "")
+                
+                # Stream LLM tokens as they arrive
+                if kind == "on_chat_model_stream":
+                    chunk = event.get("data", {}).get("chunk")
+                    if chunk and hasattr(chunk, "content") and chunk.content:
+                        full_response += chunk.content
+                        yield {"event": "token", "data": chunk.content}
+                    
+                    # Check for tool calls in streaming chunks
+                    if chunk and hasattr(chunk, "tool_call_chunks") and chunk.tool_call_chunks:
+                        for tc in chunk.tool_call_chunks:
+                            if tc.get("name"):
+                                yield {
+                                    "event": "tool_start",
+                                    "data": {"tool": tc["name"], "id": tc.get("id", "")},
+                                }
+
+                # Tool execution results
+                elif kind == "on_chain_end":
+                    output = event.get("data", {}).get("output", {})
+                    if isinstance(output, dict):
+                        messages = output.get("messages", [])
+                        for msg in messages:
+                            if hasattr(msg, "content") and isinstance(msg, ToolMessage):
+                                yield {"event": "tool_result", "data": msg.content}
+
+            # Get final state for task_id
+            try:
+                final_snapshot = await self.workflow.aget_state(config)
+                if final_snapshot and final_snapshot.values:
+                    task_id = final_snapshot.values.get("current_task_id")
+                    # Get the final response from last message if streaming missed it
+                    msgs = final_snapshot.values.get("messages", [])
+                    if msgs:
+                        last = msgs[-1]
+                        if hasattr(last, "content") and last.content and not full_response:
+                            full_response = last.content
+            except Exception:
+                pass
+
+            yield {
+                "event": "done",
+                "data": {"response": full_response, "task_id": task_id},
+            }
+
+        except Exception as exc:
+            logger.error("Stream error: %s", exc, exc_info=True)
+            yield {"event": "error", "data": str(exc)}

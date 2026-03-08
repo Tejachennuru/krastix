@@ -1,17 +1,19 @@
 # Krastix — Universal Agentic Engine
 
-A multi-agent AI orchestration platform where a central LangGraph orchestrator reasons, remembers, and delegates work to dynamically registered specialized agents.
+A multi-agent AI orchestration platform where a central LangGraph orchestrator reasons, remembers, and delegates work to dynamically registered specialized agents. Features **dual-LLM routing** (Groq Cloud + local Ollama), **SSE token streaming**, and **reliable task delivery** with agent callbacks + a background Task Watcher.
 
 ## What It Does
 
 Krastix is a **domain-agnostic agentic engine** for building AI-powered workflows. The orchestrator:
 
-1. **Reasons** — Plans responses using an LLM (Ollama qwen2.5) with RAG context injection
+1. **Reasons** — Plans responses using LLMs (Ollama local + Groq cloud) with RAG context injection
 2. **Remembers** — Stores and retrieves semantic memories scoped per domain via pgvector
 3. **Delegates** — Routes sub-tasks to specialized agents via a registry-driven dispatcher
-4. **Validates** — Enforces JSON Schema on all entity writes with optimistic concurrency
+4. **Streams** — Delivers LLM tokens in real-time to the frontend via Server-Sent Events
+5. **Validates** — Enforces JSON Schema on all entity writes with optimistic concurrency
+6. **Watches** — Background Task Watcher catches stale/lost tasks as a safety net
 
-Current agents: **CRM** (universal entity management), **Form Builder** (Tally.so), **Research** (Firecrawl + LinkedIn scraping).
+Current agents: **CRM** (universal entity management), **Form Builder** (Tally.so), **Research** (Firecrawl + LinkedIn scraping), **Doc Agent** (PDF/image extraction via Groq Vision).
 
 ---
 
@@ -22,6 +24,7 @@ Current agents: **CRM** (universal entity management), **Form Builder** (Tally.s
 - Docker & Docker Compose
 - Ollama running on a reachable host (default: Tailscale LAN node)
 - Supabase project (PostgreSQL + pgvector)
+- Groq API key (for vision + fast text models)
 - API keys: Firecrawl, ScrapeCreators (for research agent)
 
 ### 1. Configure Environment
@@ -36,9 +39,14 @@ Edit `.env` with your values:
 # Database (Supabase PostgreSQL)
 DATABASE_URL=postgresql://postgres.xxx:password@host:5432/postgres
 
-# LLM (Ollama instance — Tailscale or local)
+# LLM — Local (Ollama via Tailscale)
 OLLAMA_BASE_URL=http://100.115.107.20:11434
 OLLAMA_MODEL=qwen2.5:14b-instruct-q5_K_M
+
+# LLM — Cloud (Groq)
+GROQ_API_KEY=gsk_...              # Vision + fast text inference
+GROQ_VISION_MODEL=llama-3.2-90b-vision-preview
+GROQ_TEXT_MODEL=llama-3.3-70b-versatile
 
 # Message Queue
 REDIS_URL=redis://redis:6379/0
@@ -73,13 +81,14 @@ psql "$DATABASE_URL" -f migrations/002_universal_engine.sql
 docker compose up --build -d
 ```
 
-This starts 5 containers:
+This starts 6 containers:
 
 | Service | Container | Port | Role |
 |---------|-----------|------|------|
 | Redis | krastix-redis | 6379 | Celery broker |
-| Orchestrator | krastix-orchestrator | 8000 | LangGraph brain |
+| Orchestrator | krastix-orchestrator | 8000 | LangGraph brain + SSE streaming + Task Watcher |
 | Research Agent | krastix-research-agent | 8001 | Web research (FastAPI) |
+| Doc Agent | krastix-doc-agent | 8002 | Document extraction (Groq Vision + LangGraph) |
 | CRM Agent | krastix-crm-agent | — | Entity management (Celery) |
 | Form Agent | krastix-form-agent | — | Tally.so forms (Celery) |
 
@@ -107,20 +116,25 @@ curl -X POST http://localhost:8000/api/v1/chat \
 
 ```
 User → FastAPI Orchestrator → LangGraph (Planner → Dispatcher)
-                                  ↕              ↓
-                           Memory (pgvector)   Agent Registry
-                                               ↓
-                                    ┌──────────┼──────────┐
-                                    ↓          ↓          ↓
-                                CRM Agent  Form Agent  Research Agent
-                                (Celery)   (Celery)    (HTTP/FastAPI)
-                                    ↓          ↓          ↓
-                                PostgreSQL (Supabase + pgvector)
+          │ (SSE stream)            ↕              ↓
+          ▼                   Memory (pgvector)   Agent Registry
+   Token-by-token                                  ↓
+   to frontend              ┌───────────────────────┼─────────────┐
+                            ↓          ↓          ↓             ↓
+                        CRM Agent  Form Agent  Research Agent  Doc Agent
+                        (Celery)   (Celery)    (HTTP)         (HTTP/Groq)
+                            │          │          │             │
+                            └────── POST /callbacks/task-completed ─────┘
+                                       ↓
+                              PostgreSQL (Supabase + pgvector)
 ```
 
 **Key patterns:**
-- **Agent Registry** — Agents register in `agent_registry` table with capabilities and dispatch method. Orchestrator queries at planning time for domain-scoped routing.
-- **Schema-on-Demand** — Entity types defined in `entity_definitions` with JSON Schema. New types added via SQL, not code.
+- **Dual-LLM Routing** — Groq (cloud) for vision/speed-critical tasks; Ollama (local) for text reasoning at zero API cost.
+- **SSE Token Streaming** — `/chat/stream` delivers LLM tokens to the frontend in real-time via Server-Sent Events.
+- **Agent Registry** — Agents register in `agent_registry` with capabilities + dispatch method. Orchestrator queries at planning time.
+- **Callback + Task Watcher** — Agents call back on completion; background watcher catches anything missed after 10 minutes.
+- **Schema-on-Demand** — Entity types defined in `entity_definitions` with JSON Schema. New types via SQL.
 - **Optimistic Concurrency** — `version` column on entities. Concurrent writes detected and retried automatically.
 - **Namespace Isolation** — Memory searches scoped by `domain_key` to prevent cross-domain RAG leakage.
 
@@ -134,7 +148,8 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full system diagram, database sch
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `POST` | `/api/v1/chat` | Send a message to the orchestrator |
+| `POST` | `/api/v1/chat` | Send a message (non-streaming response) |
+| `POST` | `/api/v1/chat/stream` | Send a message (SSE token streaming) |
 | `POST` | `/callbacks/task-completed` | Agent callback on task completion |
 | `POST` | `/memory/ingest` | Ingest text into semantic memory |
 | `POST` | `/api/v1/batch/process` | Process pending batch jobs |
@@ -159,6 +174,20 @@ Response:
   "session_id": "thread-id"
 }
 ```
+
+#### POST `/api/v1/chat/stream` (SSE)
+
+Same request body as `/api/v1/chat`. Returns `text/event-stream`:
+
+```
+data: {"event": "token", "data": "I'll"}
+data: {"event": "token", "data": " research"}
+data: {"event": "tool_start", "data": {"tool": "DelegateTask", "input": {...}}}
+data: {"event": "tool_result", "data": {"tool": "DelegateTask", "output": "..."}}
+data: {"event": "done", "data": {"response": "...", "task_id": "uuid"}}
+```
+
+The frontend connects via `fetch()` + `ReadableStream` and falls back to `/api/v1/chat` on failure.
 
 #### POST `/memory/ingest`
 
@@ -257,27 +286,31 @@ The CRM agent will validate all `upsert_entity` calls for type `invoice` against
 
 ```
 krastix/
-├── docker-compose.yml          # 5 services: redis, orchestrator, crm, form, research
+├── docker-compose.yml          # 6 services: redis, orchestrator, crm, form, research, doc
 ├── init.sql                    # Full PostgreSQL schema (entities, registry, pgvector)
 ├── migrations/                 # Incremental SQL migrations
 ├── ARCHITECTURE.md             # Detailed architecture docs
 │
 ├── orchestrator/src/
-│   ├── main.py                 # FastAPI app with lifespan
-│   ├── graph.py                # LangGraph: Planner + Registry Dispatcher
+│   ├── main.py                 # FastAPI app (/chat, /chat/stream SSE, Task Watcher)
+│   ├── graph.py                # LangGraph: Planner + Dispatcher + stream_message()
 │   ├── schemas.py              # DelegateTask/QueueBatch tools + registry helpers
 │   └── services/memory.py      # Namespace-isolated RAG (pgvector + nomic-embed-text)
 │
 ├── agents/
-│   ├── crm_agent/src/worker.py       # Universal entity CRUD + OCC + JSON Schema
-│   ├── form_agent/src/worker.py      # Tally.so form management
-│   └── research_agent/src/           # Firecrawl + LinkedIn (FastAPI + LangGraph)
+│   ├── crm_agent/src/worker.py       # Universal entity CRUD + OCC + callback
+│   ├── form_agent/src/worker.py      # Tally.so form management + callback
+│   ├── research_agent/src/           # Firecrawl + LinkedIn (FastAPI + LangGraph)
+│   └── doc_agent/src/                # PDF/image VDU pipeline (Groq Vision + Ollama)
+│       ├── llm_router.py             # Dual-LLM factory (vision→Groq, text→Ollama)
+│       └── pipeline/                 # preprocess → extract → ground → audit
 │
 ├── shared/
-│   ├── database.py             # Async PostgreSQL pool + agent registry queries
+│   ├── database.py             # Async PostgreSQL pool + stale task queries
+│   ├── callbacks.py            # Agent → Orchestrator callback (httpx)
 │   └── mq.py                   # Celery configuration
 │
-└── frontend/src/               # React + Vite chat interface
+└── frontend/src/               # React + Vite chat interface (SSE consumer)
 ```
 
 ---
@@ -286,16 +319,18 @@ krastix/
 
 | Component | Technology |
 |-----------|------------|
-| LLM | Ollama (qwen2.5:14b-instruct-q5_K_M) |
+| LLM (Text) | Ollama (qwen2.5:14b-instruct-q5_K_M) — local, free |
+| LLM (Vision) | Groq (llama-3.2-90b-vision-preview) — cloud, fast |
 | Embeddings | nomic-embed-text (768d) |
 | Orchestration | LangGraph + LangChain |
-| API | FastAPI (async) |
+| API | FastAPI (async) + SSE streaming |
 | Queue | Celery + Redis 7 |
 | Database | PostgreSQL (Supabase) + pgvector |
 | Validation | JSON Schema (jsonschema) |
 | Concurrency | Optimistic Concurrency Control |
-| Containers | Docker Compose |
-| Frontend | React + Vite |
+| Reliability | Agent callbacks + Task Watcher |
+| Containers | Docker Compose (6 services) |
+| Frontend | React + Vite (SSE consumer) |
 
 ---
 
@@ -309,6 +344,9 @@ cd orchestrator && uvicorn src.main:app --reload --port 8000
 
 # Research Agent
 cd agents/research_agent && uvicorn src.main:app --reload --port 8001
+
+# Doc Agent
+cd agents/doc_agent && uvicorn src.main:app --reload --port 8002
 
 # CRM Worker
 celery -A shared.mq:celery_app worker -Q crm_queue --loglevel=info

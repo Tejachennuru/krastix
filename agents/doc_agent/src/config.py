@@ -2,24 +2,34 @@
 Document Agent — Centralised Configuration.
 
 All tunables are read from environment variables with sensible defaults.
-The VLM_MODEL var controls which vision-language model Ollama serves
-(e.g. qwen2.5-vl:7b, qwen2.5-vl:14b, qwen3-vl:7b).
+
+LLM Routing Strategy:
+  - VISION tasks (extraction, foveal re-scan) → Groq API (cloud, fast, multimodal)
+  - TEXT tasks  (audit refinement, grounding)  → Local Ollama qwen2.5:14b (free)
 """
 
 import os
 
-# ── Ollama VLM ──────────────────────────────────────────────────────
+# ── Groq Cloud API (Vision-capable) ────────────────────────────────
+GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", os.getenv("GROK_API_KEY", ""))
+GROQ_VISION_MODEL: str = os.getenv(
+    "GROQ_VISION_MODEL", "llama-3.2-90b-vision-preview"
+)
+GROQ_TEXT_MODEL: str = os.getenv(
+    "GROQ_TEXT_MODEL", "llama-3.3-70b-versatile"
+)
+
+# ── Local Ollama (Text-only — audit / refinement) ──────────────────
 OLLAMA_BASE_URL: str = os.getenv(
     "OLLAMA_BASE_URL", "http://100.115.107.20:11434"
 ).rstrip("/")
 
-# Vision-Language Model (multimodal)
-VLM_MODEL: str = os.getenv("VLM_MODEL", "qwen2.5-vl:7b")
-
-# Text-only model (used as Refiner in the audit stage)
 OLLAMA_MODEL: str = os.getenv(
     "OLLAMA_MODEL", "qwen2.5:14b-instruct-q5_K_M"
 )
+
+# Legacy: still accept VLM_MODEL env var for Ollama vision (if available)
+VLM_MODEL: str = os.getenv("VLM_MODEL", "qwen2.5-vl:7b")
 
 # ── Supabase ────────────────────────────────────────────────────────
 SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")

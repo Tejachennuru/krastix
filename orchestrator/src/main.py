@@ -1,6 +1,9 @@
+import asyncio
+import json
 import logging
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional, List, Any
 from contextlib import asynccontextmanager
@@ -15,6 +18,7 @@ logger = logging.getLogger(__name__)
 # Internal Services
 brain: Optional[OrchestratorGraph] = None
 memory_service: Optional[MemoryService] = None
+_task_watcher_handle = None
 
 # --- Models ---
 class ChatRequest(BaseModel):
@@ -33,10 +37,82 @@ class BatchTrigger(BaseModel):
     user_id: str
     batch_ids: List[str]
 
+
+# --- Task Watcher (safety net for fire-and-forget) ---
+async def task_watcher_loop(interval_seconds: int = 60, stale_minutes: int = 10):
+    """
+    Background coroutine that periodically checks for stale tasks.
+    
+    Any task stuck in 'pending' or 'processing' for > stale_minutes
+    gets flagged and the user's session is notified. This is the safety
+    net for the callback-based pattern — if an agent crashes or the
+    callback fails, this ensures no task is silently lost.
+    """
+    logger.info(
+        "Task watcher started (interval=%ds, stale_threshold=%dm)",
+        interval_seconds, stale_minutes,
+    )
+    while True:
+        try:
+            await asyncio.sleep(interval_seconds)
+
+            if not db.pool or db.pool._closed:
+                continue
+
+            stale_tasks = await db.get_stale_tasks(stale_minutes)
+            if not stale_tasks:
+                continue
+
+            logger.warning("Task watcher found %d stale tasks", len(stale_tasks))
+
+            for task in stale_tasks:
+                task_id = task["task_id"]
+                input_payload = task.get("input_payload") or {}
+                if isinstance(input_payload, str):
+                    try:
+                        input_payload = json.loads(input_payload)
+                    except json.JSONDecodeError:
+                        input_payload = {}
+
+                session_id = input_payload.get("session_id")
+                user_id = task.get("user_id")
+                domain = task.get("domain_key")
+
+                # Mark as stale to prevent re-processing
+                await db.mark_task_stale(task_id)
+
+                # Notify user's session
+                if session_id and brain and user_id:
+                    try:
+                        stale_msg = (
+                            f"SYSTEM NOTIFICATION: Task {task_id} assigned to "
+                            f"{task.get('agent_queue', 'unknown')} appears to have "
+                            f"stalled (status: {task['status']}, created: "
+                            f"{task['created_at']}). It has been marked as stale. "
+                            f"You may want to retry the request."
+                        )
+                        await brain.process_message(
+                            user_id=str(user_id),
+                            domain=domain or "HR_RECRUITER",
+                            message=stale_msg,
+                            thread_id=session_id,
+                            role="system",
+                        )
+                        logger.info("Notified session %s about stale task %s", session_id, task_id)
+                    except Exception as e:
+                        logger.warning("Failed to notify about stale task %s: %s", task_id, e)
+
+        except asyncio.CancelledError:
+            logger.info("Task watcher stopped")
+            break
+        except Exception as e:
+            logger.error("Task watcher error: %s", e, exc_info=True)
+
+
 # --- Lifecycle ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global brain, memory_service
+    global brain, memory_service, _task_watcher_handle
     logger.info("Orchestrator starting...")
     
     await db.connect()
@@ -50,9 +126,19 @@ async def lifespan(app: FastAPI):
         brain = OrchestratorGraph(memory_service=memory_service, db_pool=db.pool)
         await brain.initialize()  # Async init for PostgresSaver
         logger.info("Graph brain loaded with persistent checkpoints")
+
+        # 3. Start Task Watcher (safety net)
+        _task_watcher_handle = asyncio.create_task(task_watcher_loop())
     
     yield
+
     logger.info("Orchestrator shutting down...")
+    if _task_watcher_handle:
+        _task_watcher_handle.cancel()
+        try:
+            await _task_watcher_handle
+        except asyncio.CancelledError:
+            pass
     await db.disconnect()
 
 app = FastAPI(title="Krastix Orchestrator", lifespan=lifespan)
@@ -121,7 +207,7 @@ async def health_check():
 @app.post("/api/v1/chat")
 async def chat_endpoint(req: ChatRequest):
     """
-    User -> AI Chat.
+    User -> AI Chat (non-streaming).
     """
     if not brain: raise HTTPException(503, "Brain not initialized")
 
@@ -141,6 +227,76 @@ async def chat_endpoint(req: ChatRequest):
         logger.warning("Failed to save audit log: %s", e)
 
     return result
+
+
+@app.post("/api/v1/chat/stream")
+async def chat_stream_endpoint(req: ChatRequest):
+    """
+    User -> AI Chat with Server-Sent Events (SSE) streaming.
+    
+    Streams the LLM's thought process token-by-token to the frontend.
+    Compatible with CopilotKit/GEN UI via standard SSE format.
+    
+    SSE Event Types:
+      - token:       Partial text token from the LLM
+      - tool_start:  Agent delegation started (tool call)
+      - tool_result: Agent task dispatched/completed
+      - done:        Final response with full text + task_id
+      - error:       Error occurred during processing
+    """
+    if not brain:
+        raise HTTPException(503, "Brain not initialized")
+
+    async def event_generator():
+        full_response = ""
+        
+        try:
+            # Save user message
+            try:
+                await db.save_message(req.user_id, "user", req.message, req.session_id)
+            except Exception as e:
+                logger.warning("Failed to save user message: %s", e)
+
+            async for event in brain.stream_message(
+                user_id=req.user_id,
+                domain=req.domain,
+                message=req.message,
+                thread_id=req.session_id,
+                role="user",
+            ):
+                event_type = event.get("event", "token")
+                data = event.get("data", "")
+                
+                if event_type == "token":
+                    full_response += data
+                
+                # Format as SSE
+                payload = json.dumps(data) if not isinstance(data, str) else json.dumps(data)
+                yield f"event: {event_type}\ndata: {payload}\n\n"
+
+                if event_type == "done":
+                    # Save assistant response
+                    try:
+                        response_text = data.get("response", full_response) if isinstance(data, dict) else full_response
+                        await db.save_message(
+                            req.user_id, "assistant", response_text, req.session_id
+                        )
+                    except Exception as e:
+                        logger.warning("Failed to save assistant message: %s", e)
+
+        except Exception as e:
+            logger.error("SSE stream error: %s", e, exc_info=True)
+            yield f"event: error\ndata: {json.dumps(str(e))}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 @app.post("/callbacks/task-completed")
 async def agent_callback(payload: TaskCallback):

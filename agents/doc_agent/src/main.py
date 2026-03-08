@@ -27,11 +27,15 @@ from src.config import (
     VLM_MODEL,
     OLLAMA_BASE_URL,
     STORAGE_BUCKET,
+    GROQ_API_KEY,
+    GROQ_VISION_MODEL,
+    OLLAMA_MODEL,
 )
 from src.models import AgentResponse, DocumentTask
 from src.graph import DocumentPipeline
 from src.storage import download_file, upload_artifact, detect_file_type
 from src.pipeline.grounding import chunk_document
+from src.llm_router import get_llm_info
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -66,7 +70,12 @@ async def lifespan(app: FastAPI):
 
     # 2. Initialise the VDU pipeline
     pipeline = DocumentPipeline()
-    logger.info("VDU Pipeline initialised (VLM: %s @ %s)", VLM_MODEL, OLLAMA_BASE_URL)
+    llm_info = get_llm_info()
+    logger.info(
+        "VDU Pipeline initialised — Vision: %s (%s), Text: %s (%s)",
+        llm_info["vision_model"], llm_info["vision_provider"],
+        llm_info["text_model"], llm_info["text_provider"],
+    )
 
     yield
 
@@ -366,31 +375,55 @@ async def run_document(task: DocumentTask, bg: BackgroundTasks):
 
     bg.add_task(execute_document_task, task)
 
+    llm_info = get_llm_info()
     return AgentResponse(
         status="accepted",
         task_id=task_id,
-        message=f"Document pipeline started (VLM: {VLM_MODEL}).",
+        message=f"Document pipeline started (Vision: {llm_info['vision_provider']}/{llm_info['vision_model']}, Text: {llm_info['text_model']}).",
     )
 
 
 @app.get("/health")
 async def health():
-    """Liveness probe — checks VLM availability."""
-    vlm_status = "unknown"
+    """Liveness probe — checks LLM availability."""
+    llm_info = get_llm_info()
 
+    # Check Groq vision availability
+    vision_status = "unknown"
+    if llm_info["groq_available"]:
+        try:
+            from src.llm_router import get_vision_llm
+            vlm = get_vision_llm()
+            vision_status = f"groq:{llm_info['vision_model']}"
+        except Exception as exc:
+            vision_status = f"groq_error ({exc})"
+    else:
+        # Fallback check: local Ollama VLM
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(f"{OLLAMA_BASE_URL}/api/tags")
+                if resp.status_code == 200:
+                    models = resp.json().get("models", [])
+                    model_names = [m.get("name", "") for m in models]
+                    vision_status = "ollama_vlm_available" if any(
+                        VLM_MODEL.split(":")[0] in n for n in model_names
+                    ) else f"ollama_vlm_not_found"
+        except Exception as exc:
+            vision_status = f"unreachable ({exc})"
+
+    # Check local text model
+    text_status = "unknown"
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.get(f"{OLLAMA_BASE_URL}/api/tags")
             if resp.status_code == 200:
                 models = resp.json().get("models", [])
                 model_names = [m.get("name", "") for m in models]
-                vlm_status = "available" if any(
-                    VLM_MODEL.split(":")[0] in n for n in model_names
+                text_status = "available" if any(
+                    OLLAMA_MODEL.split(":")[0] in n for n in model_names
                 ) else f"model_not_found (have: {model_names[:5]})"
-            else:
-                vlm_status = f"ollama_error ({resp.status_code})"
     except Exception as exc:
-        vlm_status = f"unreachable ({exc})"
+        text_status = f"unreachable ({exc})"
 
     db_status = "unknown"
     try:
@@ -401,8 +434,16 @@ async def health():
 
     return {
         "status": "online",
-        "engine": "VDU Pipeline + LangGraph",
-        "vlm_model": VLM_MODEL,
-        "vlm_status": vlm_status,
+        "engine": "VDU Pipeline + LangGraph + Dual-LLM",
+        "vision": {
+            "provider": llm_info["vision_provider"],
+            "model": llm_info["vision_model"],
+            "status": vision_status,
+        },
+        "text": {
+            "provider": llm_info["text_provider"],
+            "model": llm_info["text_model"],
+            "status": text_status,
+        },
         "database": db_status,
     }
