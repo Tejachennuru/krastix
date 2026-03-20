@@ -1,9 +1,15 @@
 import logging
+import os
+from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Any
 from contextlib import asynccontextmanager
+
+import jwt
+from passlib.context import CryptContext
 
 from shared.database import db
 from shared.mq import celery_app
@@ -11,6 +17,32 @@ from orchestrator.src.graph import OrchestratorGraph
 from orchestrator.src.services.memory import MemoryService
 
 logger = logging.getLogger(__name__)
+
+# --- Auth Config ---
+JWT_SECRET = os.getenv("JWT_SECRET")
+if not JWT_SECRET:
+    logger.warning(
+        "JWT_SECRET is not set. Using an insecure default — set this env var before deploying."
+    )
+    JWT_SECRET = "krastix-insecure-default-secret-CHANGE-ME"
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_DAYS = 7
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def _hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+def _verify_password(plain: str, hashed: str) -> bool:
+    return pwd_context.verify(plain, hashed)
+
+def _create_token(user_id: str, email: str) -> str:
+    payload = {
+        "sub": user_id,
+        "email": email,
+        "exp": datetime.now(timezone.utc) + timedelta(days=JWT_EXPIRE_DAYS),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 # Internal Services
 brain: Optional[OrchestratorGraph] = None
@@ -115,6 +147,70 @@ async def health_check():
         health_status["status"] = "degraded"
 
     return health_status
+
+# --- Auth Models ---
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+    full_name: Optional[str] = None
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+# --- Auth Endpoints ---
+@app.post("/auth/register")
+async def register(req: RegisterRequest):
+    """Register a new user account."""
+    if not db.pool:
+        raise HTTPException(503, "Database not available")
+    async with db.pool.acquire() as conn:
+        existing = await conn.fetchrow(
+            "SELECT id FROM profiles WHERE email = $1", req.email
+        )
+        if existing:
+            raise HTTPException(400, "Email already registered")
+        hashed = await run_in_threadpool(_hash_password, req.password)
+        user_id = await conn.fetchval(
+            "INSERT INTO profiles (email, full_name, password_hash) VALUES ($1, $2, $3) RETURNING id",
+            req.email, req.full_name, hashed
+        )
+    token = _create_token(str(user_id), req.email)
+    return {"token": token, "user_id": str(user_id), "email": req.email, "full_name": req.full_name}
+
+@app.post("/auth/login")
+async def login(req: LoginRequest):
+    """Authenticate and return a JWT token."""
+    if not db.pool:
+        raise HTTPException(503, "Database not available")
+    async with db.pool.acquire() as conn:
+        user = await conn.fetchrow(
+            "SELECT id, email, full_name, password_hash FROM profiles WHERE email = $1",
+            req.email
+        )
+    if not user or not user["password_hash"]:
+        raise HTTPException(401, "Invalid email or password")
+    if not await run_in_threadpool(_verify_password, req.password, user["password_hash"]):
+        raise HTTPException(401, "Invalid email or password")
+    token = _create_token(str(user["id"]), user["email"])
+    return {
+        "token": token,
+        "user_id": str(user["id"]),
+        "email": user["email"],
+        "full_name": user["full_name"],
+    }
+
+# --- Domain List ---
+@app.get("/domains")
+async def list_domains():
+    """Return available domain configs for the frontend selector."""
+    if not db.pool:
+        return []
+    async with db.pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT domain_key, display_name FROM domain_configs ORDER BY created_at"
+        )
+    return [dict(row) for row in rows]
 
 # --- Endpoints ---
 
