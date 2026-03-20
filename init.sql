@@ -15,11 +15,17 @@ CREATE EXTENSION IF NOT EXISTS vector;
 CREATE TABLE IF NOT EXISTS profiles (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     email VARCHAR(255) UNIQUE NOT NULL,
+    full_name VARCHAR(255),
+    password_hash VARCHAR(255),
     tier VARCHAR(50) DEFAULT 'free', -- 'free', 'pro', 'enterprise'
     credits INTEGER DEFAULT 100,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Migration: add columns if upgrading an existing deployment
+ALTER TABLE profiles ADD COLUMN IF NOT EXISTS full_name VARCHAR(255);
+ALTER TABLE profiles ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255);
 
 -- --------------------------------------------
 -- 3. THE "STEERING" (Configuration & Rules)
@@ -408,8 +414,8 @@ INSERT INTO entity_definitions (entity_type, description, validation_schema) VAL
 ON CONFLICT (entity_type) DO NOTHING;
 
 -- 9.3 Seed Test User
-INSERT INTO profiles (id, email, tier, credits)
-VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'test@example.com', 'pro', 1000)
+INSERT INTO profiles (id, email, full_name, tier, credits)
+VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'test@example.com', 'Test User', 'pro', 1000)
 ON CONFLICT (email) DO NOTHING;
 
 -- ============================================
