@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS entities (
     display_name TEXT,
     status VARCHAR(50),
     data JSONB DEFAULT '{}'::jsonb,
+    version INTEGER DEFAULT 1,
     derived_skills TEXT[] GENERATED ALWAYS AS (extract_skills_from_data(data)) STORED,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
@@ -94,6 +95,18 @@ CREATE TABLE IF NOT EXISTS batch_jobs (
     instruction TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     processed_at TIMESTAMPTZ
+);
+
+-- Agent Registry: Dynamic agent discovery (Registry Pattern)
+CREATE TABLE IF NOT EXISTS agent_registry (
+    agent_id VARCHAR(100) PRIMARY KEY,
+    queue VARCHAR(100) NOT NULL,
+    capabilities JSONB NOT NULL DEFAULT '[]'::jsonb,
+    supported_domains JSONB NOT NULL DEFAULT '[]'::jsonb,
+    description TEXT,
+    health_endpoint VARCHAR(255),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- --------------------------------------------
@@ -199,6 +212,7 @@ ALTER TABLE integrations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE checkpoints ENABLE ROW LEVEL SECURITY;
 ALTER TABLE checkpoint_writes ENABLE ROW LEVEL SECURITY;
 ALTER TABLE batch_jobs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agent_registry ENABLE ROW LEVEL SECURITY;
 
 -- User Policies (Can only see their own data)
 DO $$ BEGIN
@@ -242,6 +256,10 @@ DO $$ BEGIN
     CREATE POLICY "public_read_entity_definitions" ON entity_definitions FOR SELECT USING (true);
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
+DO $$ BEGIN
+    CREATE POLICY "public_read_agent_registry" ON agent_registry FOR SELECT USING (true);
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
 -- Service Role Policies (Backend/Workers have full access)
 DO $$ BEGIN
     CREATE POLICY "service_full_access_profiles" ON profiles FOR ALL USING (auth.role() = 'service_role');
@@ -281,6 +299,10 @@ EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 DO $$ BEGIN
     CREATE POLICY "service_full_access_batch_jobs" ON batch_jobs FOR ALL USING (auth.role() = 'service_role');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    CREATE POLICY "service_full_access_agent_registry" ON agent_registry FOR ALL USING (auth.role() = 'service_role');
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 -- --------------------------------------------
@@ -413,7 +435,74 @@ INSERT INTO entity_definitions (entity_type, description, validation_schema) VAL
 )
 ON CONFLICT (entity_type) DO NOTHING;
 
--- 9.3 Seed Test User
+-- 9.3 Seed Agent Registry
+INSERT INTO agent_registry (agent_id, queue, capabilities, supported_domains, description, health_endpoint) VALUES
+(
+    'crm_universal_v1',
+    'crm_queue',
+    '["upsert_entity", "get_entities"]'::jsonb,
+    '["HR_RECRUITER", "SALES_LEAD_GEN"]'::jsonb,
+    'Universal CRM agent — manages entities (candidates, leads, contacts) with schema validation and optimistic concurrency.',
+    NULL
+),
+(
+    'form_tally_v1',
+    'form_queue',
+    '["create_form", "list_forms"]'::jsonb,
+    '["HR_RECRUITER"]'::jsonb,
+    'Form builder agent — creates and manages Tally.so forms for applications and surveys.',
+    NULL
+),
+(
+    'research_firecrawl_v1',
+    'research_queue',
+    '["web_search", "scrape_url", "linkedin_profile", "linkedin_company", "site_map"]'::jsonb,
+    '["HR_RECRUITER", "PERSONAL_ASSISTANT", "SALES_LEAD_GEN"]'::jsonb,
+    'Research agent — performs web searches, scrapes pages, maps sites, and retrieves LinkedIn data.',
+    'http://research_agent:8001/health'
+)
+ON CONFLICT (agent_id) DO UPDATE SET
+    capabilities = EXCLUDED.capabilities,
+    supported_domains = EXCLUDED.supported_domains,
+    description = EXCLUDED.description,
+    updated_at = NOW();
+
+-- 9.4 Seed additional entity definitions
+INSERT INTO entity_definitions (entity_type, description, validation_schema) VALUES
+(
+    'lead',
+    'A potential sales lead or prospect',
+    '{
+        "type": "object",
+        "properties": {
+            "email": {"type": "string"},
+            "company": {"type": "string"},
+            "phone": {"type": "string"},
+            "source": {"type": "string"},
+            "deal_value": {"type": "number"},
+            "notes": {"type": "string"}
+        },
+        "required": ["email", "company"]
+    }'::jsonb
+),
+(
+    'contact',
+    'A general contact entry',
+    '{
+        "type": "object",
+        "properties": {
+            "email": {"type": "string"},
+            "phone": {"type": "string"},
+            "company": {"type": "string"},
+            "role": {"type": "string"},
+            "notes": {"type": "string"}
+        },
+        "required": ["email"]
+    }'::jsonb
+)
+ON CONFLICT (entity_type) DO NOTHING;
+
+-- 9.5 Seed Test User
 INSERT INTO profiles (id, email, full_name, tier, credits)
 VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'test@example.com', 'Test User', 'pro', 1000)
 ON CONFLICT (email) DO NOTHING;

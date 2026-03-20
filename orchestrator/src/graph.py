@@ -1,6 +1,7 @@
 import os
 import logging
 import traceback
+import httpx
 from typing import TypedDict, List, Annotated, Optional, Dict, Any
 from uuid import UUID
 
@@ -14,7 +15,7 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from shared.database import db
 from shared.mq import celery_app
-from orchestrator.src.schemas import DelegateTask, QueueBatch
+from orchestrator.src.schemas import DelegateTask, QueueBatch, build_agent_capability_prompt, build_dispatch_map
 
 logger = logging.getLogger(__name__)
 
@@ -34,22 +35,28 @@ class OrchestratorGraph:
         self.db_pool = db_pool
         
         # Initialize Ollama (Local Model)
-        # Using mistral-nemo (or configured model)
-        ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
-        model_name = os.getenv("OLLAMA_MODEL", "mistral-nemo")
+        # Using qwen2.5:32b (or configured model)# Connect to the LLM running on 'cogaan' via Tailscale
+        ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://100.115.107.20:11434")
+        # Ensure base URL is clean (no trailing slash) as the library handles paths
+        ollama_base_url = ollama_base_url.rstrip("/")
+        
+        model_name = os.getenv("OLLAMA_MODEL", "qwen2.5:14b-instruct-q5_K_M")
         
         logger.info(f"Initializing Orchestrator with Ollama: {model_name} at {ollama_base_url}")
         
         llm = ChatOllama(
             model=model_name,
             base_url=ollama_base_url,
-            temperature=0
+            temperature=0,
+            # Increase timeout for tool calling with large local models
+            timeout=120.0
         )
         self.llm_with_tools = llm.bind_tools([DelegateTask, QueueBatch])
         
         # Checkpointer will be initialized async
         self.checkpointer = None
         self.workflow = None
+        self._pg_cm = None  # Holds async context manager for cleanup
 
     async def initialize(self) -> None:
         """Async initialization for PostgresSaver with URL cleaning."""
@@ -60,18 +67,12 @@ class OrchestratorGraph:
             # FIX: Ensure URL is compatible with psycopg (remove +asyncpg if present)
             conn_string = raw_url.replace("postgresql+asyncpg://", "postgresql://")
 
-            # For Supabase transaction pooler (port 6543), disable prepared statements
-            # by appending to the connection string if not already present
-            if "prepare_threshold" not in conn_string:
-                separator = "&" if "?" in conn_string else "?"
-                conn_string += f"{separator}prepare_threshold=0"
-
-            # Create the checkpointer using the async context manager
-            checkpointer = await AsyncPostgresSaver.from_conn_string(conn_string).__aenter__()
+            # from_conn_string is an async context manager — enter it and keep ref for cleanup
+            self._pg_cm = AsyncPostgresSaver.from_conn_string(conn_string)
+            self.checkpointer = await self._pg_cm.__aenter__()
             
             # This creates the necessary 'checkpoints' tables if they don't exist
-            await checkpointer.setup()
-            self.checkpointer = checkpointer
+            await self.checkpointer.setup()
             logger.info("PostgresSaver connected (persistent memory)")
             
         except Exception as e:
@@ -137,7 +138,8 @@ class OrchestratorGraph:
                 try:
                     results = await self.memory_service.search_memory(
                         user_id=state["user_id"], 
-                        query_text=last_human_msg.content, 
+                        query_text=last_human_msg.content,
+                        domain_key=state["domain"],
                         limit=3
                     )
                     if results:
@@ -147,9 +149,18 @@ class OrchestratorGraph:
                 except Exception as e:
                     logger.warning("Memory search failed (non-critical): %s", e)
 
+            # 2b. AGENT REGISTRY INJECTION — domain-scoped capabilities
+            agent_context = ""
+            try:
+                domain_agents = await db.get_agents_for_domain(state["domain"])
+                if domain_agents:
+                    agent_context = build_agent_capability_prompt(domain_agents)
+            except Exception as e:
+                logger.warning("Agent registry lookup failed (non-critical): %s", e)
+
             # 3. Construct Prompt
             agent_info = f"\n\nAllowed Queues: {', '.join(allowed_queues)}"
-            final_sys_prompt = sys_prompt + rag_context + agent_info
+            final_sys_prompt = sys_prompt + rag_context + agent_context + agent_info
             
             # 4. Invoke LLM
             messages = [SystemMessage(content=final_sys_prompt)] + state["messages"]
@@ -175,7 +186,7 @@ class OrchestratorGraph:
         return "respond"
 
     async def node_dispatcher(self, state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
-        """The Hands: Executes Tool Calls (DelegateTask, QueueBatch)."""
+        """The Hands: Executes Tool Calls using registry-driven dispatch."""
         last_message = state["messages"][-1]
         tool_outputs = []
         
@@ -188,6 +199,14 @@ class OrchestratorGraph:
             logger.error("Failed to fetch domain config in dispatcher: %s", e, exc_info=True)
             domain_config = None
         allowed_queues = domain_config.get("allowed_agent_queues", []) if domain_config else []
+
+        # Build registry-driven dispatch map
+        dispatch_map = {}
+        try:
+            domain_agents = await db.get_agents_for_domain(state["domain"])
+            dispatch_map = build_dispatch_map(domain_agents)
+        except Exception as e:
+            logger.warning("Registry dispatch map failed, using legacy routing: %s", e)
 
         for tool_call in last_message.tool_calls:
             tool_name = tool_call["name"]
@@ -218,12 +237,67 @@ class OrchestratorGraph:
                     }
                 )
                 
-                # Dispatch to Celery
-                celery_app.send_task(
-                    "agents.perform_task",
-                    args=[args["instruction"], state["user_id"], str(task_id)],
-                    queue=queue
-                )
+                # Registry-driven dispatch
+                route = dispatch_map.get(queue)
+                
+                if route and route["method"] == "http":
+                    # Generic HTTP dispatch (research agent, doc agent, etc.)
+                    target_url = queue  # queue_or_url is the HTTP base URL
+                    endpoint = route.get("http_endpoint", "/research/run")
+                    try:
+                        async with httpx.AsyncClient(timeout=15.0) as client:
+                            resp = await client.post(
+                                f"{target_url}{endpoint}",
+                                json={
+                                    "user_id": state["user_id"],
+                                    "task_type": "GENERAL_SEARCH",
+                                    "query_or_url": args["instruction"],
+                                    "instruction": args["instruction"],
+                                    "context_metadata": {
+                                        "task_id": str(task_id),
+                                        "session_id": thread_id,
+                                        "domain_key": state["domain"]
+                                    }
+                                }
+                            )
+                            resp.raise_for_status()
+                    except Exception as e:
+                        logger.error("HTTP dispatch to %s%s failed: %s", target_url, endpoint, e)
+                elif route and route["method"] == "celery":
+                    # Celery dispatch using registry task name
+                    celery_app.send_task(
+                        route["task_name"],
+                        args=[str(task_id)],
+                        queue=queue
+                    )
+                else:
+                    # Legacy fallback: use hardcoded mapping
+                    if queue == "research_queue":
+                        research_url = os.getenv("RESEARCH_AGENT_URL", "http://localhost:8001")
+                        try:
+                            async with httpx.AsyncClient(timeout=15.0) as client:
+                                resp = await client.post(
+                                    f"{research_url}/research/run",
+                                    json={
+                                        "user_id": state["user_id"],
+                                        "task_type": "GENERAL_SEARCH",
+                                        "query_or_url": args["instruction"],
+                                        "context_metadata": {
+                                            "task_id": str(task_id),
+                                            "session_id": thread_id
+                                        }
+                                    }
+                                )
+                                resp.raise_for_status()
+                        except Exception as e:
+                            logger.error("Legacy HTTP dispatch to research agent failed: %s", e)
+                    else:
+                        legacy_map = {
+                            "crm_queue": "agents.crm_worker.execute_task",
+                            "form_queue": "agents.form_worker.execute_task",
+                        }
+                        task_name = legacy_map.get(queue, "agents.perform_task")
+                        celery_app.send_task(task_name, args=[str(task_id)], queue=queue)
                 
                 tool_outputs.append(
                     ToolMessage(
@@ -282,3 +356,88 @@ class OrchestratorGraph:
             "response": response_text,
             "task_id": final_state.get("current_task_id")
         }
+
+    async def stream_message(self, user_id: str, domain: str, message: str, thread_id: str, role: str = "user"):
+        """
+        Stream the graph execution, yielding SSE events as tokens arrive.
+        
+        Yields dicts with event types:
+          {"event": "token",     "data": "partial text"}
+          {"event": "tool_call", "data": {"tool": "DelegateTask", "args": {...}}}
+          {"event": "tool_result", "data": "Task dispatched..."}
+          {"event": "done",      "data": {"response": "full text", "task_id": "..."}}
+          {"event": "error",     "data": "error message"}
+        """
+        if not self.workflow:
+            yield {"event": "error", "data": "Graph not initialized"}
+            return
+
+        config = {"configurable": {"thread_id": thread_id}}
+
+        if role == "system":
+            input_message = SystemMessage(content=message)
+        else:
+            input_message = HumanMessage(content=message)
+
+        initial_state = {
+            "user_id": user_id,
+            "domain": domain,
+            "messages": [input_message]
+        }
+
+        full_response = ""
+        task_id = None
+
+        try:
+            async for event in self.workflow.astream_events(
+                initial_state, config=config, version="v2"
+            ):
+                kind = event.get("event", "")
+                
+                # Stream LLM tokens as they arrive
+                if kind == "on_chat_model_stream":
+                    chunk = event.get("data", {}).get("chunk")
+                    if chunk and hasattr(chunk, "content") and chunk.content:
+                        full_response += chunk.content
+                        yield {"event": "token", "data": chunk.content}
+                    
+                    # Check for tool calls in streaming chunks
+                    if chunk and hasattr(chunk, "tool_call_chunks") and chunk.tool_call_chunks:
+                        for tc in chunk.tool_call_chunks:
+                            if tc.get("name"):
+                                yield {
+                                    "event": "tool_start",
+                                    "data": {"tool": tc["name"], "id": tc.get("id", "")},
+                                }
+
+                # Tool execution results
+                elif kind == "on_chain_end":
+                    output = event.get("data", {}).get("output", {})
+                    if isinstance(output, dict):
+                        messages = output.get("messages", [])
+                        for msg in messages:
+                            if hasattr(msg, "content") and isinstance(msg, ToolMessage):
+                                yield {"event": "tool_result", "data": msg.content}
+
+            # Get final state for task_id
+            try:
+                final_snapshot = await self.workflow.aget_state(config)
+                if final_snapshot and final_snapshot.values:
+                    task_id = final_snapshot.values.get("current_task_id")
+                    # Get the final response from last message if streaming missed it
+                    msgs = final_snapshot.values.get("messages", [])
+                    if msgs:
+                        last = msgs[-1]
+                        if hasattr(last, "content") and last.content and not full_response:
+                            full_response = last.content
+            except Exception:
+                pass
+
+            yield {
+                "event": "done",
+                "data": {"response": full_response, "task_id": task_id},
+            }
+
+        except Exception as exc:
+            logger.error("Stream error: %s", exc, exc_info=True)
+            yield {"event": "error", "data": str(exc)}
