@@ -132,6 +132,25 @@ services:
     command: celery -A shared.mq:celery_app worker --loglevel=info -Q form_queue --include=agent.src.worker
 
   # -----------------------------
+  # Frontend (React + Vite)
+  # -----------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: krastix-frontend
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    depends_on:
+      - orchestrator
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    command: npm run dev -- --host 0.0.0.0
+
+  # -----------------------------
   # Agent 4: Document (VDU)
   # -----------------------------
   doc_agent:
@@ -160,25 +179,6 @@ services:
       - ./agents/doc_agent/src:/app/src
       - ./shared:/app/shared
     command: uvicorn src.main:app --host 0.0.0.0 --port 8002 --reload
-
-  # -----------------------------
-  # Frontend (React + Vite)
-  # -----------------------------
-  frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
-    container_name: krastix-frontend
-    ports:
-      - "5173:5173"
-    environment:
-      - VITE_API_URL=http://localhost:8000
-    depends_on:
-      - orchestrator
-    volumes:
-      - ./frontend:/app
-      - /app/node_modules
-    command: npm run dev -- --host 0.0.0.0
 
 volumes:
   redis_data:
