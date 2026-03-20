@@ -11,3 +11,5 @@ langchain-core
 langchain-ollama
 langgraph-checkpoint-postgres
 psycopg[binary,pool]
+passlib[bcrypt]==1.7.4
+PyJWT==2.12.0
