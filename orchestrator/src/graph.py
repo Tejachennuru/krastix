@@ -1,6 +1,9 @@
 import os
 import logging
 import traceback
+import asyncio
+import time
+import re
 import httpx
 from typing import TypedDict, List, Annotated, Optional, Dict, Any
 from uuid import UUID
@@ -33,6 +36,9 @@ class OrchestratorGraph:
     def __init__(self, memory_service=None, db_pool=None):
         self.memory_service = memory_service
         self.db_pool = db_pool
+        self._domain_cache: Dict[str, tuple] = {}
+        self._agents_cache: Dict[str, tuple] = {}
+        self._cache_ttl_seconds = 30
         
         # Initialize Ollama (Local Model)
         # Using qwen2.5:32b (or configured model)# Connect to the LLM running on 'cogaan' via Tailscale
@@ -83,6 +89,50 @@ class OrchestratorGraph:
         # Compile graph with whatever checkpointer worked
         self.workflow = self._build_graph()
 
+    def _cache_get(self, store: Dict[str, tuple], key: str):
+        item = store.get(key)
+        if not item:
+            return None
+        value, ts = item
+        if (time.monotonic() - ts) > self._cache_ttl_seconds:
+            store.pop(key, None)
+            return None
+        return value
+
+    def _cache_set(self, store: Dict[str, tuple], key: str, value: Any):
+        store[key] = (value, time.monotonic())
+
+    async def _get_domain_config_cached(self, domain_key: str) -> Optional[Dict[str, Any]]:
+        cached = self._cache_get(self._domain_cache, domain_key)
+        if cached is not None:
+            return cached
+        config = await db.get_domain_config(domain_key)
+        self._cache_set(self._domain_cache, domain_key, config)
+        return config
+
+    async def _get_agents_for_domain_cached(self, domain_key: str) -> List[Dict[str, Any]]:
+        cached = self._cache_get(self._agents_cache, domain_key)
+        if cached is not None:
+            return cached
+        agents = await db.get_agents_for_domain(domain_key)
+        self._cache_set(self._agents_cache, domain_key, agents)
+        return agents
+
+    def _is_delegation_likely(self, text: str) -> bool:
+        t = (text or "").strip().lower()
+        if not t:
+            return False
+
+        patterns = [
+            r"\b(create|build|generate|design|draft)\b.*\b(form|survey|questionnaire|quiz|checklist)\b",
+            r"\b(list|show|get|fetch|find|retrieve|check)\b.*\b(forms|responses|submissions|entries|applicants)\b",
+            r"\b(research|scrape|crawl|enrich|prospect|find)\b",
+            r"\b(delegate|queue|batch|run|execute)\b.*\b(task|job|workflow|agent)\b",
+            r"\bcrm\b",
+            r"https?://tally\.so/",
+        ]
+        return any(re.search(p, t) for p in patterns)
+
     def _build_graph(self):
         graph = StateGraph(AgentState)
         graph.add_node("planner", self.node_planner)
@@ -102,6 +152,19 @@ class OrchestratorGraph:
 
         return graph.compile(checkpointer=self.checkpointer)
 
+    def _is_checkpoint_schema_error(self, exc: Exception) -> bool:
+        text = str(exc).lower()
+        return (
+            "operator does not exist: bytea ->" in text
+            or "prepared statement" in text
+            or "checkpoint" in text and "bytea" in text
+        )
+
+    def _switch_to_memory_checkpointer(self):
+        logger.warning("Switching graph checkpointer to MemorySaver due to runtime checkpoint error")
+        self.checkpointer = MemorySaver()
+        self.workflow = self._build_graph()
+
     # --- Node Implementations ---
 
     async def node_planner(self, state: AgentState) -> Dict[str, Any]:
@@ -109,12 +172,18 @@ class OrchestratorGraph:
         logger.info("Planner activated for user: %s", state['user_id'])
         
         try:
-            # 1. Fetch Domain Config (Handle Defaults if DB fails)
+            # 1. Fetch domain config and domain agents in parallel
+            config = None
+            domain_agents: List[Dict[str, Any]] = []
             try:
-                config = await db.get_domain_config(state["domain"])
+                config, domain_agents = await asyncio.gather(
+                    self._get_domain_config_cached(state["domain"]),
+                    self._get_agents_for_domain_cached(state["domain"]),
+                )
             except Exception as e:
-                logger.error("DB Config Error for domain '%s': %s", state["domain"], e, exc_info=True)
+                logger.error("Domain bootstrap error for '%s': %s", state["domain"], e, exc_info=True)
                 config = None
+                domain_agents = []
 
             if config is None:
                 logger.warning("No config found for domain '%s', using defaults.", state["domain"])
@@ -133,8 +202,10 @@ class OrchestratorGraph:
             # 2. RAG MEMORY INJECTION
             rag_context = ""
             last_human_msg = next((m for m in reversed(state["messages"]) if isinstance(m, HumanMessage)), None)
+            likely_delegate = self._is_delegation_likely(last_human_msg.content if last_human_msg else "")
             
-            if self.memory_service and last_human_msg:
+            # Skip memory lookup for obvious tool-delegation prompts to shave latency.
+            if self.memory_service and last_human_msg and not likely_delegate:
                 try:
                     results = await self.memory_service.search_memory(
                         user_id=state["user_id"], 
@@ -152,7 +223,6 @@ class OrchestratorGraph:
             # 2b. AGENT REGISTRY INJECTION — domain-scoped capabilities
             agent_context = ""
             try:
-                domain_agents = await db.get_agents_for_domain(state["domain"])
                 if domain_agents:
                     agent_context = build_agent_capability_prompt(domain_agents)
             except Exception as e:
@@ -160,7 +230,18 @@ class OrchestratorGraph:
 
             # 3. Construct Prompt
             agent_info = f"\n\nAllowed Queues: {', '.join(allowed_queues)}"
-            final_sys_prompt = sys_prompt + rag_context + agent_context + agent_info
+            
+            # Explicit Override to prevent hallucinating Markdown text instead of actual tool usage
+            hard_rule = (
+                "\n\nCRITICAL: Do not simulate backend work in plain text. "
+                "Use DelegateTask for forms/research/agent jobs. "
+                "For form creation use form_queue with task_action='create_form' and parameters.blocks. "
+                "Always set a specific form title in parameters.form_name based on user intent. "
+                "For any choice field (dropdown/multiple choice/checkbox), include options exactly in parameters.blocks[].options. "
+                "For applicant retrieval use form_queue with task_action='list_form_responses' and parameters.form_url or parameters.form_id."
+            )
+            
+            final_sys_prompt = sys_prompt + rag_context + agent_context + agent_info + hard_rule
             
             # 4. Invoke LLM
             messages = [SystemMessage(content=final_sys_prompt)] + state["messages"]
@@ -189,12 +270,13 @@ class OrchestratorGraph:
         """The Hands: Executes Tool Calls using registry-driven dispatch."""
         last_message = state["messages"][-1]
         tool_outputs = []
+        dispatched_task_id = None  # Track the last dispatched task_id
         
         thread_id = config.get("configurable", {}).get("thread_id", "unknown_session")
         
         # Fetch allowed queues for validation
         try:
-            domain_config = await db.get_domain_config(state["domain"])
+            domain_config = await self._get_domain_config_cached(state["domain"])
         except Exception as e:
             logger.error("Failed to fetch domain config in dispatcher: %s", e, exc_info=True)
             domain_config = None
@@ -203,7 +285,7 @@ class OrchestratorGraph:
         # Build registry-driven dispatch map
         dispatch_map = {}
         try:
-            domain_agents = await db.get_agents_for_domain(state["domain"])
+            domain_agents = await self._get_agents_for_domain_cached(state["domain"])
             dispatch_map = build_dispatch_map(domain_agents)
         except Exception as e:
             logger.warning("Registry dispatch map failed, using legacy routing: %s", e)
@@ -232,6 +314,8 @@ class OrchestratorGraph:
                     agent_queue=queue,
                     input_payload={
                         "instruction": args["instruction"],
+                        "task_action": args.get("task_action", ""),
+                        "parameters": args.get("parameters", {}),
                         "priority": args.get("priority", 1),
                         "session_id": thread_id  # Critical for callback routing
                     }
@@ -305,7 +389,7 @@ class OrchestratorGraph:
                         content=f"Task {task_id} dispatched to {queue}. I will notify you when complete."
                     )
                 )
-                state["current_task_id"] = str(task_id)
+                dispatched_task_id = str(task_id)
 
             elif tool_name == "QueueBatch":
                 # Create Batch Job with full schema compliance
@@ -323,7 +407,12 @@ class OrchestratorGraph:
                     )
                 )
 
-        return {"messages": tool_outputs}
+        # CRITICAL: Return current_task_id as part of the state update.
+        # LangGraph nodes must *return* state changes; mutating `state` dict directly is ignored.
+        result = {"messages": tool_outputs}
+        if dispatched_task_id:
+            result["current_task_id"] = dispatched_task_id
+        return result
 
     # --- Public Interface ---
     async def process_message(self, user_id: str, domain: str, message: str, thread_id: str, role: str = "user") -> Dict[str, Any]:
@@ -346,7 +435,15 @@ class OrchestratorGraph:
             "messages": [input_message]
         }
         
-        final_state = await self.workflow.ainvoke(initial_state, config=config)
+        try:
+            final_state = await self.workflow.ainvoke(initial_state, config=config)
+        except Exception as e:
+            if self._is_checkpoint_schema_error(e):
+                logger.warning("Checkpoint runtime error in process_message: %s", e)
+                self._switch_to_memory_checkpointer()
+                final_state = await self.workflow.ainvoke(initial_state, config=config)
+            else:
+                raise
         
         # Extract response
         last_msg = final_state["messages"][-1]
@@ -414,24 +511,31 @@ class OrchestratorGraph:
                 elif kind == "on_chain_end":
                     output = event.get("data", {}).get("output", {})
                     if isinstance(output, dict):
+                        # Capture task_id from dispatcher's state update
+                        if output.get("current_task_id"):
+                            task_id = output["current_task_id"]
                         messages = output.get("messages", [])
                         for msg in messages:
                             if hasattr(msg, "content") and isinstance(msg, ToolMessage):
                                 yield {"event": "tool_result", "data": msg.content}
 
-            # Get final state for task_id
+            # Get final state for task_id (belt-and-suspenders with on_chain_end above)
             try:
                 final_snapshot = await self.workflow.aget_state(config)
                 if final_snapshot and final_snapshot.values:
-                    task_id = final_snapshot.values.get("current_task_id")
+                    snapshot_task_id = final_snapshot.values.get("current_task_id")
+                    if snapshot_task_id:
+                        task_id = snapshot_task_id
                     # Get the final response from last message if streaming missed it
                     msgs = final_snapshot.values.get("messages", [])
                     if msgs:
                         last = msgs[-1]
                         if hasattr(last, "content") and last.content and not full_response:
                             full_response = last.content
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Failed to get final state snapshot: %s", e)
+
+            logger.info("SSE stream done — task_id=%s, response_len=%d", task_id, len(full_response))
 
             yield {
                 "event": "done",
@@ -439,5 +543,23 @@ class OrchestratorGraph:
             }
 
         except Exception as exc:
+            if self._is_checkpoint_schema_error(exc):
+                logger.warning("Checkpoint runtime error in stream_message: %s", exc)
+                self._switch_to_memory_checkpointer()
+                try:
+                    fallback = await self.process_message(user_id, domain, message, thread_id, role)
+                    yield {
+                        "event": "done",
+                        "data": {
+                            "response": fallback.get("response", ""),
+                            "task_id": fallback.get("task_id"),
+                        },
+                    }
+                    return
+                except Exception as fallback_exc:
+                    logger.error("Stream fallback failed: %s", fallback_exc, exc_info=True)
+                    yield {"event": "error", "data": str(fallback_exc)}
+                    return
+
             logger.error("Stream error: %s", exc, exc_info=True)
             yield {"event": "error", "data": str(exc)}

@@ -15,6 +15,14 @@ class DelegateTask(BaseModel):
     instruction: str = Field(..., description="Precise instruction for the agent")
     agent_queue: str = Field(..., description="Target agent queue (must be in domain's allowed_agent_queues)")
     priority: int = Field(default=1, description="Task priority (1-5)")
+    task_action: str = Field(
+        default="",
+        description="Optional explicit action for the target agent (e.g. create_form, list_forms, list_form_responses)"
+    )
+    parameters: Dict[str, Any] = Field(
+        default_factory=dict, 
+        description="Dynamic structural dependencies (e.g. for `form_queue`, output a `blocks` array of dicts with 'label' and 'type' like INPUT_TEXT, FILE_UPLOAD, TEXTAREA)"
+    )
 
 class QueueBatch(BaseModel):
     """

@@ -46,7 +46,10 @@ class Database:
 
         logger.info("Connecting to Database at %s:%s...", host_ip, port)
 
-        # 3. Create the Connection Pool
+        # 3. Create/Recreate the Connection Pool
+        if self.pool and getattr(self.pool, "_closed", False):
+            self.pool = None
+
         if not self.pool:
             try:
                 self.pool = await asyncpg.create_pool(
@@ -66,6 +69,7 @@ class Database:
         """Close connection pool."""
         if self.pool:
             await self.pool.close()
+            self.pool = None
             logger.info("Database disconnected")
             
     # --- Configuration & Users ---
@@ -139,30 +143,39 @@ class Database:
 
     # --- Conversation History ---
 
-    async def save_message(self, user_id: str, role: str, message: str, session_id: Optional[str] = None):
+    async def save_message(self, user_id: str, role: str, message: str, session_id: Optional[str] = None, domain: str = "HR_RECRUITER"):
         """
         Appends a message to the conversation history.
         If session_id (conversation_id) is provided, it updates that specific row.
         """
-        msg_obj = {"role": role, "content": message, "timestamp": str(datetime.now())}
+        msg_obj = {"role": role, "content": message, "timestamp": datetime.now().isoformat()}
         
         async with self.pool.acquire() as conn:
             if session_id:
-                # Append to existing history using Postgres JSONB operator '||'
-                await conn.execute(
-                    """
-                    UPDATE conversations
-                    SET conversation_history = conversation_history || $1::jsonb,
-                        updated_at = NOW()
-                    WHERE id = $2
-                    """,
-                    json.dumps([msg_obj]), UUID(str(session_id))
-                )
+                try:
+                    # Append to existing history using Postgres JSONB operator '||'
+                    res = await conn.execute(
+                        """
+                        UPDATE conversations
+                        SET conversation_history = conversation_history || $1::jsonb,
+                            updated_at = NOW()
+                        WHERE id = $2
+                        """,
+                        json.dumps([msg_obj]), UUID(str(session_id))
+                    )
+                    
+                    if res == "UPDATE 0":
+                        logger.info("Initializing new conversation row for session %s", session_id)
+                        await conn.execute(
+                            "INSERT INTO conversations (id, user_id, domain_key, conversation_history) VALUES ($1, $2, $3, $4)",
+                            UUID(str(session_id)), UUID(str(user_id)), domain, json.dumps([msg_obj])
+                        )
+                    else:
+                        logger.debug("Appended message to existing session %s", session_id)
+                except Exception as e:
+                    logger.error("Failed to save message to DB: %s", e, exc_info=True)
             else:
-                # Fallback: We need a session/conversation. If none provided, we can't easily save 
-                # to a specific conversation without creating one. 
-                # For now, we'll log a warning if this case happens in this architecture.
-                print(f"⚠️ Warning: save_message called without session_id for user {user_id}")
+                logger.warning("save_message called without session_id for user %s", user_id)
 
 
     async def save_conversation(self, user_id: UUID, domain_key: str,
@@ -188,6 +201,19 @@ class Database:
                     user_id, domain_key, json.dumps(conversation_history), current_plan
                 )
                 return conv_id
+
+    async def get_user_conversations(self, user_id: UUID, domain_key: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Fetch all conversation summaries for a user"""
+        async with self.pool.acquire() as conn:
+            query = "SELECT id, domain_key, updated_at FROM conversations WHERE user_id = $1"
+            params = [user_id]
+            if domain_key:
+                query += " AND domain_key = $2"
+                params.append(domain_key)
+            query += " ORDER BY updated_at DESC"
+            
+            rows = await conn.fetch(query, *params)
+            return [dict(r) for r in rows]
 
     async def get_conversation(self, conversation_id: UUID, user_id: UUID) -> Optional[Dict[str, Any]]:
         """Fetch conversation"""

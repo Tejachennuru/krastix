@@ -29,17 +29,170 @@ function TaskBadge({ count }) {
 export default function ChatPage() {
   const { user, logout } = useAuth();
   const [domains, setDomains] = useState([]);
-  const [selectedDomain, setSelectedDomain] = useState('');
+  const [selectedDomain, setSelectedDomain] = useState(() => {
+    return localStorage.getItem('krastix_selected_domain') || '';
+  });
   const [messages, setMessages] = useState([]);
   const [inputMessage, setInputMessage] = useState('');
-  const [sessionId] = useState(() => crypto.randomUUID());
+  const [sessionId, setSessionId] = useState('');
+  const [recentChats, setRecentChats] = useState([]);
+
+  // Load/Generate session ID when domain changes
+  useEffect(() => {
+    if (selectedDomain) {
+      const storageKey = `krastix_session_id_${selectedDomain}`;
+      let saved = localStorage.getItem(storageKey);
+      if (!saved) {
+        saved = crypto.randomUUID();
+        localStorage.setItem(storageKey, saved);
+      }
+      setSessionId(saved);
+      localStorage.setItem('krastix_session_id', saved); // Backward compatibility/Main active session
+    }
+  }, [selectedDomain]);
+
+  // Restored state hooks
   const [loading, setLoading] = useState(false);
   const [pendingTasks, setPendingTasks] = useState([]);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const messagesEndRef = useRef(null);
   const textareaRef = useRef(null);
+  const handledTaskIdsRef = useRef(new Set());
+
+  const [showIntegrations, setShowIntegrations] = useState(false);
+  const [integrationTokens, setIntegrationTokens] = useState({ tally: '', jotform: '' });
+  const [activeIntegrations, setActiveIntegrations] = useState([]);
+  const [tallyForms, setTallyForms] = useState([]);
+  const [loadingTallyForms, setLoadingTallyForms] = useState(false);
+  const [storedApplicants, setStoredApplicants] = useState([]);
+  const [loadingStoredApplicants, setLoadingStoredApplicants] = useState(false);
+  const [applicantFormFilter, setApplicantFormFilter] = useState('');
 
   useEffect(() => { fetchDomains(); }, []);
+
+  const fetchIntegrations = async () => {
+    try {
+      const res = await fetch(`${API_URL}/api/v1/integrations/${user.user_id}`);
+      const data = await res.json();
+      setActiveIntegrations(data.map(i => i.provider));
+    } catch (err) {
+      console.error('Failed to load integrations', err);
+    }
+  };
+
+  const fetchTallyForms = async () => {
+    if (!user?.user_id) return;
+    setLoadingTallyForms(true);
+    try {
+      const res = await fetch(`${API_URL}/api/v1/forms/tally/${user.user_id}`);
+      const data = await res.json();
+      if (data?.status === 'success' && Array.isArray(data.forms)) {
+        setTallyForms(data.forms);
+      } else {
+        setTallyForms([]);
+      }
+    } catch (err) {
+      console.error('Failed to load tally forms', err);
+      setTallyForms([]);
+    } finally {
+      setLoadingTallyForms(false);
+    }
+  };
+
+  const fetchStoredApplicants = async (formFilter = '') => {
+    if (!user?.user_id) return;
+    setLoadingStoredApplicants(true);
+    try {
+      const suffix = formFilter ? `&form_id=${encodeURIComponent(formFilter)}` : '';
+      const res = await fetch(`${API_URL}/api/v1/applicants/stored?user_id=${user.user_id}${suffix}`);
+      const data = await res.json();
+      if (data?.status === 'success' && Array.isArray(data.items)) {
+        setStoredApplicants(data.items);
+      } else {
+        setStoredApplicants([]);
+      }
+    } catch (err) {
+      console.error('Failed to load stored applicants', err);
+      setStoredApplicants([]);
+    } finally {
+      setLoadingStoredApplicants(false);
+    }
+  };
+
+  useEffect(() => {
+    if (showIntegrations) {
+      fetchIntegrations();
+      if (activeIntegrations.includes('tally')) {
+        fetchTallyForms();
+      }
+    }
+  }, [showIntegrations]);
+
+  useEffect(() => {
+    if (showIntegrations && activeIntegrations.includes('tally')) {
+      fetchTallyForms();
+      fetchStoredApplicants(applicantFormFilter);
+    }
+  }, [showIntegrations, activeIntegrations.length]);
+
+  useEffect(() => {
+    if (showIntegrations && activeIntegrations.includes('tally')) {
+      fetchStoredApplicants(applicantFormFilter);
+    }
+  }, [applicantFormFilter]);
+
+  const saveIntegration = async (provider) => {
+    const token = integrationTokens[provider];
+    if (!token) return;
+    try {
+      const res = await fetch(`${API_URL}/api/v1/integrations`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_id: user.user_id, provider, access_token: token })
+      });
+      if (res.ok) {
+        alert(`${provider} connected successfully!`);
+        fetchIntegrations();
+        setIntegrationTokens(prev => ({ ...prev, [provider]: '' }));
+      }
+    } catch (err) {
+      alert(`Failed to connect ${provider}`);
+    }
+  };
+
+  // Fetch Conversation History
+  useEffect(() => {
+    if (user?.user_id && sessionId) {
+      console.log("Fetching history for session:", sessionId);
+      fetch(`${API_URL}/api/v1/chat/history?session_id=${sessionId}&user_id=${user.user_id}`)
+        .then(res => res.json())
+        .then(data => {
+          if (Array.isArray(data)) {
+            setMessages(data.map(m => ({ 
+              role: m.role, 
+              content: m.content, 
+              ts: m.timestamp ? new Date(m.timestamp.replace(' ', 'T')).getTime() : Date.now() 
+            })));
+          }
+        }).catch(err => console.error("Error fetching history:", err));
+    }
+  }, [user, sessionId]);
+
+  // Fetch Recent Chats for Sidebar
+  const fetchRecentChats = async () => {
+    if (!user?.user_id) return;
+    try {
+      const res = await fetch(`${API_URL}/api/v1/conversations?user_id=${user.user_id}${selectedDomain ? `&domain_key=${selectedDomain}` : ''}`);
+      const data = await res.json();
+      setRecentChats(data);
+    } catch (err) {
+      console.error("Error fetching recent chats:", err);
+    }
+  };
+
+  useEffect(() => {
+    fetchRecentChats();
+  }, [user, selectedDomain, messages.length]); // Refresh list when messages are added
 
   const appendMessage = (role, content) => {
     setMessages((prev) => [...prev, { role, content, ts: Date.now() }]);
@@ -48,17 +201,44 @@ export default function ChatPage() {
   const checkPendingTasks = useCallback(async () => {
     const stillPending = [];
     for (const taskId of pendingTasks) {
+      if (handledTaskIdsRef.current.has(taskId)) {
+        continue;
+      }
       try {
         const res = await fetch(`${API_URL}/task/${taskId}?user_id=${user.user_id}`);
+        if (res.status === 404) {
+          stillPending.push(taskId);
+          continue;
+        }
+
         const data = await res.json();
-        if (data.status === 'completed') {
-          appendMessage('assistant', `✅ Task completed:\n\`\`\`\n${JSON.stringify(data.result, null, 2)}\n\`\`\``);
-        } else if (data.status === 'failed') {
-          appendMessage('assistant', `❌ Task failed: ${data.error}`);
+
+        if (data.status === 'completed' || data.status === 'success') {
+          const result = data.result || {};
+          const innerData = result.data || {};
+          if (result.action === 'create_form' && innerData.form_url) {
+            appendMessage(
+              'assistant',
+              `Task complete. Form "${innerData.form_title || 'Generated Form'}" is ready.\nPublic link: ${innerData.form_url}${innerData.edit_url ? `\nEdit link: ${innerData.edit_url}` : ''}`
+            );
+          } else if (result.action === 'list_form_responses') {
+            const count = innerData.applicants_count ?? (Array.isArray(innerData.applicants) ? innerData.applicants.length : 0);
+            appendMessage(
+              'assistant',
+              `Task complete. Retrieved ${count} response${count === 1 ? '' : 's'} for form ${innerData.form_url || innerData.form_id || ''}.`
+            );
+          } else {
+            appendMessage('assistant', `Task complete.\n${JSON.stringify(data.result, null, 2)}`);
+          }
+          handledTaskIdsRef.current.add(taskId);
+        } else if (data.status === 'failed' || data.status === 'stale') {
+          appendMessage('assistant', `Task failed: ${data.error || 'Timeout or unknown error'}`);
+          handledTaskIdsRef.current.add(taskId);
         } else {
           stillPending.push(taskId);
         }
-      } catch {
+      } catch (err) {
+        console.error("Task Polling Error:", err);
         stillPending.push(taskId);
       }
     }
@@ -82,7 +262,14 @@ export default function ChatPage() {
       const data = await res.json();
       if (Array.isArray(data) && data.length > 0) {
         setDomains(data);
-        setSelectedDomain(data[0].domain_key);
+        const saved = localStorage.getItem('krastix_selected_domain');
+        const exists = data.some(d => d.domain_key === saved);
+        if (exists) {
+          setSelectedDomain(saved);
+        } else {
+          setSelectedDomain(data[0].domain_key);
+          localStorage.setItem('krastix_selected_domain', data[0].domain_key);
+        }
       }
     } catch {
       // Backend may be starting up; domains remain empty
@@ -98,7 +285,7 @@ export default function ChatPage() {
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
 
     try {
-      const res = await fetch(`${API_URL}/api/v1/chat`, {
+      const res = await fetch(`${API_URL}/api/v1/chat/stream`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -111,13 +298,93 @@ export default function ChatPage() {
           session_id: sessionId,
         }),
       });
-      const data = await res.json();
-      appendMessage('assistant', data.response || data.message || JSON.stringify(data));
-      if (data.pending_tasks?.length > 0) {
-        setPendingTasks((prev) => [...prev, ...data.pending_tasks]);
+
+      if (!res.ok) {
+        throw new Error(`Server returned ${res.status}`);
+      }
+
+      setLoading(false);
+      let streamedResponse = '';
+
+      // Append a placeholder message that we will actively update
+      appendMessage('assistant', '...');
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+
+      // --- Robust SSE parser using a line buffer ---
+      // SSE events are separated by blank lines (\n\n).
+      // Chunks from the reader may split an event across reads.
+      let sseBuffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        sseBuffer += decoder.decode(value, { stream: true });
+
+        // Process all complete events (separated by double newlines)
+        const parts = sseBuffer.split('\n\n');
+        // The last part may be incomplete — keep it in the buffer
+        sseBuffer = parts.pop() || '';
+
+        for (const event of parts) {
+          if (!event.trim()) continue;
+
+          const eventMatch = event.match(/event: (.*)/);
+          const dataMatch = event.match(/data: (.*)/s);
+
+          if (!dataMatch) continue;
+
+          const eventType = eventMatch ? eventMatch[1].trim() : 'token';
+          let parsedData = dataMatch[1].trim();
+          try { parsedData = JSON.parse(parsedData); } catch (e) { }
+
+          if (eventType === 'token') {
+            streamedResponse += parsedData;
+            setMessages(prev => {
+              const newMessages = [...prev];
+              if (newMessages[newMessages.length - 1].role === 'assistant') {
+                newMessages[newMessages.length - 1].content = streamedResponse || '...';
+              }
+              return newMessages;
+            });
+          } else if (eventType === 'tool_start') {
+            const toolMsg = `\n\nAgent is executing a delegated task (${parsedData.tool}). You will be notified when results are ready.`;
+            streamedResponse += toolMsg;
+            setMessages(prev => {
+              const newMessages = [...prev];
+              if (newMessages[newMessages.length - 1].role === 'assistant') {
+                newMessages[newMessages.length - 1].content = streamedResponse;
+              }
+              return newMessages;
+            });
+          } else if (eventType === 'tool_result') {
+            // Fallback: extract task_id from the ToolMessage content
+            // Format: "Task <uuid> dispatched to <queue>. ..."
+            const resultStr = typeof parsedData === 'string' ? parsedData : '';
+            const taskMatch = resultStr.match(/Task ([0-9a-f-]{36}) dispatched/i);
+            if (taskMatch) {
+              const extractedId = taskMatch[1];
+              console.log('[SSE] task_id extracted from tool_result:', extractedId);
+              setPendingTasks(prev => {
+                if (prev.includes(extractedId)) return prev;
+                return [...prev, extractedId];
+              });
+            }
+          } else if (eventType === 'done') {
+            if (parsedData && parsedData.task_id) {
+              console.log('[SSE] task_id from done event:', parsedData.task_id);
+              setPendingTasks(prev => {
+                if (prev.includes(parsedData.task_id)) return prev;
+                return [...prev, parsedData.task_id];
+              });
+            }
+          }
+        }
       }
     } catch (err) {
-      appendMessage('assistant', `⚠️ Error: ${err.message}`);
+      appendMessage('assistant', `⚠️ Network Error: LLM on remote node timed out or disconnected. Details: ${err.message}`);
     } finally {
       setLoading(false);
     }
@@ -138,17 +405,197 @@ export default function ChatPage() {
   const startNewChat = () => {
     setMessages([]);
     setPendingTasks([]);
+    handledTaskIdsRef.current = new Set();
+    const newId = crypto.randomUUID();
+    const storageKey = `krastix_session_id_${selectedDomain}`;
+    localStorage.setItem(storageKey, newId);
+    setSessionId(newId);
+  };
+
+  const switchChat = (id) => {
+    // Determine the domain of the chat we're switching to
+    const chat = recentChats.find(c => c.id === id);
+    if (chat && chat.domain_key !== selectedDomain) {
+       setSelectedDomain(chat.domain_key);
+       localStorage.setItem('krastix_selected_domain', chat.domain_key);
+    }
+    setMessages([]);
+    setPendingTasks([]);
+    handledTaskIdsRef.current = new Set();
+    setSessionId(id);
+    const storageKey = `krastix_session_id_${chat?.domain_key || selectedDomain}`;
+    localStorage.setItem(storageKey, id);
   };
 
   const domainLabel = domains.find((d) => d.domain_key === selectedDomain)?.display_name || selectedDomain;
 
   return (
-    <div className="flex h-screen bg-[#0d0d14] text-white overflow-hidden">
+    <div className="flex h-screen bg-[#0d0d14] text-white overflow-hidden relative">
+      {/* Integrations Modal */}
+      {showIntegrations && (
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
+          <div className="bg-[#13131f] border border-white/10 rounded-2xl w-full max-w-md shadow-2xl overflow-hidden flex flex-col">
+            <div className="px-6 py-5 border-b border-white/10 flex justify-between items-center bg-white/[0.02]">
+              <h3 className="text-lg font-bold">App Integrations</h3>
+              <button onClick={() => setShowIntegrations(false)} className="text-slate-400 hover:text-white">
+                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
+              </button>
+            </div>
+            <div className="p-6 space-y-6">
+              {/* Tally Integration */}
+              <div className="bg-white/[0.02] border border-white/5 rounded-xl p-4">
+                <div className="flex justify-between items-center mb-3">
+                  <div className="flex items-center gap-3">
+                    <div className="w-10 h-10 rounded-lg bg-pink-500/20 text-pink-400 flex items-center justify-center font-bold text-xl">T</div>
+                    <div>
+                      <h4 className="font-semibold text-sm">Tally Forms</h4>
+                      <p className="text-xs text-slate-400">Generate intelligent surveys</p>
+                    </div>
+                  </div>
+                  {activeIntegrations.includes('tally') ? (
+                    <span className="text-xs font-semibold text-emerald-400 bg-emerald-400/10 px-2 py-1 rounded">Connected</span>
+                  ) : (
+                    <span className="text-xs font-semibold text-slate-500">Not Connected</span>
+                  )}
+                </div>
+                {!activeIntegrations.includes('tally') && (
+                  <div className="flex gap-2">
+                    <input type="password" placeholder="Tally Personal Access Token..." value={integrationTokens.tally} onChange={(e) => setIntegrationTokens(prev => ({ ...prev, tally: e.target.value }))} className="flex-1 bg-[#0d0d14] border border-white/10 rounded-lg px-3 py-2 text-sm focus:ring-1 focus:ring-pink-500" />
+                    <button onClick={() => saveIntegration('tally')} className="bg-white text-black font-semibold text-sm px-4 py-2 rounded-lg hover:bg-slate-200">Save</button>
+                  </div>
+                )}
+
+                {activeIntegrations.includes('tally') && (
+                  <div className="mt-4 border-t border-white/10 pt-3">
+                    <div className="flex items-center justify-between mb-2">
+                      <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">Active Tally Forms</p>
+                      <button
+                        onClick={fetchTallyForms}
+                        className="text-[11px] text-pink-300 hover:text-pink-200"
+                        disabled={loadingTallyForms}
+                      >
+                        {loadingTallyForms ? 'Refreshing...' : 'Refresh'}
+                      </button>
+                    </div>
+                    <div className="max-h-44 overflow-y-auto space-y-2 pr-1">
+                      {loadingTallyForms && (
+                        <p className="text-xs text-slate-500">Loading forms...</p>
+                      )}
+                      {!loadingTallyForms && tallyForms.length === 0 && (
+                        <p className="text-xs text-slate-500">No forms found for this Tally account.</p>
+                      )}
+                      {!loadingTallyForms && tallyForms.map((form) => (
+                        <div key={form.id || form.url} className="bg-[#0d0d14] border border-white/10 rounded-lg px-3 py-2">
+                          <p className="text-xs text-white font-medium truncate">{form.title || 'Untitled Form'}</p>
+                          <p className="text-[11px] text-slate-400 truncate">{form.url}</p>
+                          <button
+                            onClick={() => {
+                              setInputMessage(`Get me the applicants list for this form ${form.url}`);
+                              setShowIntegrations(false);
+                            }}
+                            className="mt-2 text-[11px] bg-pink-500/20 border border-pink-500/40 text-pink-300 px-2 py-1 rounded hover:bg-pink-500/30"
+                          >
+                            Use For Applicants Query
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+
+                    <div className="mt-4 border-t border-white/10 pt-3">
+                      <div className="flex items-center justify-between mb-2 gap-2">
+                        <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">Stored Applicants</p>
+                        <div className="flex items-center gap-2">
+                          <select
+                            value={applicantFormFilter}
+                            onChange={(e) => setApplicantFormFilter(e.target.value)}
+                            className="bg-[#0d0d14] border border-white/10 rounded-md px-2 py-1 text-[11px] text-slate-300"
+                          >
+                            <option value="">All Forms</option>
+                            {tallyForms.map((f) => (
+                              <option key={f.id || f.url} value={f.id || ''}>
+                                {(f.title || 'Untitled').slice(0, 24)}{(f.title || '').length > 24 ? '...' : ''}
+                              </option>
+                            ))}
+                          </select>
+                          <button
+                            onClick={() => fetchStoredApplicants(applicantFormFilter)}
+                            className="text-[11px] text-pink-300 hover:text-pink-200"
+                            disabled={loadingStoredApplicants}
+                          >
+                            {loadingStoredApplicants ? 'Refreshing...' : 'Refresh'}
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="max-h-52 overflow-auto border border-white/10 rounded-lg">
+                        <table className="w-full text-[11px]">
+                          <thead className="bg-white/[0.03] text-slate-400 sticky top-0">
+                            <tr>
+                              <th className="text-left px-2 py-1.5 font-medium">Form</th>
+                              <th className="text-left px-2 py-1.5 font-medium">Response</th>
+                              <th className="text-left px-2 py-1.5 font-medium">Submitted</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {loadingStoredApplicants && (
+                              <tr>
+                                <td colSpan={3} className="px-2 py-3 text-slate-500">Loading cached applicants...</td>
+                              </tr>
+                            )}
+                            {!loadingStoredApplicants && storedApplicants.length === 0 && (
+                              <tr>
+                                <td colSpan={3} className="px-2 py-3 text-slate-500">No cached applicant submissions yet.</td>
+                              </tr>
+                            )}
+                            {!loadingStoredApplicants && storedApplicants.map((row) => (
+                              <tr key={row.id} className="border-t border-white/5 text-slate-300 hover:bg-white/[0.02]">
+                                <td className="px-2 py-1.5 align-top">{row.source_form_id || '-'}</td>
+                                <td className="px-2 py-1.5 align-top">{row.response_id || '-'}</td>
+                                <td className="px-2 py-1.5 align-top">
+                                  {row.submitted_at ? new Date(row.submitted_at).toLocaleString() : '-'}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Jotform Integration */}
+              <div className="bg-white/[0.02] border border-white/5 rounded-xl p-4">
+                <div className="flex justify-between items-center mb-3">
+                  <div className="flex items-center gap-3">
+                    <div className="w-10 h-10 rounded-lg bg-orange-500/20 text-orange-400 flex items-center justify-center font-bold text-xl">J</div>
+                    <div>
+                      <h4 className="font-semibold text-sm">Jotform</h4>
+                      <p className="text-xs text-slate-400">Enterprise form builder</p>
+                    </div>
+                  </div>
+                  {activeIntegrations.includes('jotform') ? (
+                    <span className="text-xs font-semibold text-emerald-400 bg-emerald-400/10 px-2 py-1 rounded">Connected</span>
+                  ) : (
+                    <span className="text-xs font-semibold text-slate-500">Not Connected</span>
+                  )}
+                </div>
+                {!activeIntegrations.includes('jotform') && (
+                  <div className="flex gap-2">
+                    <input type="password" placeholder="Jotform API Key..." value={integrationTokens.jotform} onChange={(e) => setIntegrationTokens(prev => ({ ...prev, jotform: e.target.value }))} className="flex-1 bg-[#0d0d14] border border-white/10 rounded-lg px-3 py-2 text-sm focus:ring-1 focus:ring-orange-500" />
+                    <button onClick={() => saveIntegration('jotform')} className="bg-white text-black font-semibold text-sm px-4 py-2 rounded-lg hover:bg-slate-200">Save</button>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ── Sidebar ── */}
       <aside
-        className={`flex flex-col bg-[#13131f] border-r border-white/8 transition-all duration-300 ${
-          sidebarOpen ? 'w-64' : 'w-0 overflow-hidden'
-        }`}
+        className={`flex flex-col bg-[#13131f] border-r border-white/8 transition-all duration-300 ${sidebarOpen ? 'w-64' : 'w-0 overflow-hidden'
+          }`}
       >
         {/* Logo */}
         <div className="flex items-center gap-3 px-5 py-5 border-b border-white/8">
@@ -168,7 +615,11 @@ export default function ChatPage() {
             </label>
             <select
               value={selectedDomain}
-              onChange={(e) => setSelectedDomain(e.target.value)}
+              onChange={(e) => {
+                const val = e.target.value;
+                setSelectedDomain(val);
+                localStorage.setItem('krastix_selected_domain', val);
+              }}
               className="w-full bg-[#0d0d14] border border-white/10 text-white text-sm rounded-xl px-3 py-2.5 focus:outline-none focus:ring-2 focus:ring-indigo-500/50"
             >
               {domains.length === 0 ? (
@@ -194,21 +645,61 @@ export default function ChatPage() {
             New Conversation
           </button>
 
+          {/* Integrations */}
+          <button
+            onClick={() => setShowIntegrations(true)}
+            className="w-full flex items-center gap-2 bg-pink-600/20 hover:bg-pink-600/30 border border-pink-500/30 text-pink-300 text-sm font-medium rounded-xl px-3 py-2.5 transition-all"
+          >
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M13.19 8.688a4.5 4.5 0 011.242 7.244l-4.5 4.5a4.5 4.5 0 01-6.364-6.364l1.757-1.757m13.35-.622l1.757-1.757a4.5 4.5 0 00-6.364-6.364l-4.5 4.5a4.5 4.5 0 001.242 7.244" />
+            </svg>
+            App Integrations
+          </button>
+
           {/* Pending Tasks */}
           {pendingTasks.length > 0 && <TaskBadge count={pendingTasks.length} />}
 
-          {/* Placeholder recent chats */}
+          {/* Recent Chats */}
           <div>
-            <label className="text-xs font-medium text-slate-500 uppercase tracking-widest mb-2 block">
-              Recent
+            <label className="text-xs font-medium text-slate-500 uppercase tracking-widest mb-3 block">
+              Recent Conversations
             </label>
-            {messages.length > 0 ? (
-              <div className="bg-white/5 hover:bg-white/8 rounded-xl px-3 py-2.5 text-sm text-slate-300 cursor-pointer truncate border border-white/5 transition-all">
-                {messages[0]?.content?.slice(0, 40) || 'Current chat'}…
-              </div>
-            ) : (
-              <p className="text-xs text-slate-600 px-1">No recent conversations</p>
-            )}
+            <div className="space-y-1.5">
+              {recentChats.length > 0 ? (
+                recentChats.map((chat) => (
+                  <div
+                    key={chat.id}
+                    onClick={() => switchChat(chat.id)}
+                    className={`group relative flex flex-col gap-1 px-3 py-2.5 rounded-xl text-sm transition-all cursor-pointer border ${
+                      sessionId === chat.id 
+                        ? 'bg-indigo-600/10 border-indigo-500/30 text-indigo-300' 
+                        : 'bg-white/[0.02] border-white/5 text-slate-400 hover:bg-white/5 hover:border-white/10 hover:text-slate-200'
+                    }`}
+                  >
+                    <div className="flex justify-between items-start">
+                      <span className="font-medium truncate pr-4">
+                        {chat.id === sessionId ? "Active Research" : `Session ${chat.id.slice(0, 8)}`}
+                      </span>
+                      <span className="text-[10px] text-slate-500 whitespace-nowrap">
+                        {new Date(chat.updated_at).toLocaleDateString()}
+                      </span>
+                    </div>
+                    {chat.domain_key && (
+                      <span className="text-[10px] uppercase tracking-tighter opacity-50 font-bold">
+                        {chat.domain_key}
+                      </span>
+                    )}
+                    {sessionId === chat.id && (
+                      <div className="absolute left-0 top-1/4 bottom-1/4 w-0.5 bg-indigo-500 rounded-full" />
+                    )}
+                  </div>
+                ))
+              ) : (
+                <div className="px-1 py-4 text-center border border-dashed border-white/5 rounded-xl">
+                  <p className="text-xs text-slate-600 italic">No history in this domain</p>
+                </div>
+              )}
+            </div>
           </div>
         </div>
 
@@ -311,11 +802,10 @@ export default function ChatPage() {
                       {msg.role === 'user' ? (user.full_name?.split(' ')[0] || 'You') : 'Krastix'}
                     </span>
                     <div
-                      className={`rounded-2xl px-4 py-3 text-sm leading-relaxed whitespace-pre-wrap break-words ${
-                        msg.role === 'user'
-                          ? 'bg-indigo-600 text-white rounded-tr-sm'
-                          : 'bg-[#1e1e2e] border border-white/8 text-slate-200 rounded-tl-sm'
-                      }`}
+                      className={`rounded-2xl px-4 py-3 text-sm leading-relaxed whitespace-pre-wrap break-words ${msg.role === 'user'
+                        ? 'bg-indigo-600 text-white rounded-tr-sm'
+                        : 'bg-[#1e1e2e] border border-white/8 text-slate-200 rounded-tl-sm'
+                        }`}
                     >
                       {msg.content}
                     </div>
@@ -336,6 +826,27 @@ export default function ChatPage() {
                       <span className="w-2 h-2 bg-indigo-400 rounded-full animate-bounce [animation-delay:150ms]" />
                       <span className="w-2 h-2 bg-indigo-400 rounded-full animate-bounce [animation-delay:300ms]" />
                     </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Background task processing indicator */}
+              {!loading && pendingTasks.length > 0 && (
+                <div className="flex gap-3">
+                  <div className="w-8 h-8 rounded-full bg-gradient-to-br from-amber-500 to-orange-600 flex items-center justify-center flex-shrink-0 animate-pulse">
+                    <svg className="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182M2.985 19.644l3.182-3.182" />
+                    </svg>
+                  </div>
+                  <div className="bg-gradient-to-r from-amber-500/10 to-orange-500/10 border border-amber-500/20 rounded-2xl rounded-tl-sm px-4 py-3 max-w-[75%]">
+                    <div className="flex items-center gap-2 text-sm text-amber-300">
+                      <span className="relative flex h-2 w-2">
+                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75" />
+                        <span className="relative inline-flex rounded-full h-2 w-2 bg-amber-400" />
+                      </span>
+                      <span className="font-medium">Processing background task…</span>
+                    </div>
+                    <p className="text-xs text-slate-400 mt-1">Your delegated task is running. Results will appear here automatically.</p>
                   </div>
                 </div>
               )}
