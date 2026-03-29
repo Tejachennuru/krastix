@@ -12,6 +12,7 @@ import aiohttp
 from shared.mq import celery_app
 from shared.database import db
 from shared.callbacks import notify_task_completed
+from shared.integrations_crypto import decrypt_secret
 
 logger = logging.getLogger(__name__)
 
@@ -557,7 +558,7 @@ class FormWorker:
             "SELECT access_token FROM integrations WHERE user_id = $1 AND provider = 'tally'",
             user_id
         )
-        return row['access_token'] if row else None
+        return decrypt_secret(row['access_token']) if row else None
 
     # ── Tally block type map ──────────────────────────────────────────────────
     # Maps every type the orchestrator may send → valid Tally API block type.

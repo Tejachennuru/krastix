@@ -2,6 +2,7 @@ import os
 import logging
 import socket
 import json
+import asyncio
 import asyncpg
 from urllib.parse import urlparse
 from typing import Optional, Dict, Any, List
@@ -46,24 +47,58 @@ class Database:
 
         logger.info("Connecting to Database at %s:%s...", host_ip, port)
 
-        # 3. Create/Recreate the Connection Pool
+        # 3. Create/Recreate the Connection Pool with retry for transient DNS/network errors.
         if self.pool and getattr(self.pool, "_closed", False):
             self.pool = None
 
         if not self.pool:
-            try:
-                self.pool = await asyncpg.create_pool(
-                    connection_url,
-                    min_size=2,
-                    max_size=10,
-                    command_timeout=60,
-                    statement_cache_size=0, # Fixed for Supabase PgBouncer
-                    ssl="require" 
+            max_attempts = int(os.getenv("DB_CONNECT_MAX_ATTEMPTS", "10"))
+            last_error = None
+
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    self.pool = await asyncpg.create_pool(
+                        connection_url,
+                        min_size=2,
+                        max_size=10,
+                        command_timeout=60,
+                        statement_cache_size=0,  # Fixed for Supabase PgBouncer
+                        ssl="require"
+                    )
+                    logger.info("Database connected successfully on attempt %d", attempt)
+                    break
+                except Exception as e:
+                    last_error = e
+                    self.pool = None
+                    wait_seconds = min(2 * attempt, 15)
+                    logger.warning(
+                        "Database connect attempt %d/%d failed: %s. Retrying in %ss...",
+                        attempt,
+                        max_attempts,
+                        e,
+                        wait_seconds,
+                    )
+                    await asyncio.sleep(wait_seconds)
+
+                    # Retry DNS resolution each attempt in case network comes up late.
+                    try:
+                        refreshed_ip = socket.gethostbyname(hostname)
+                        if refreshed_ip and refreshed_ip != host_ip:
+                            logger.info("Resolved %s to %s for retry", hostname, refreshed_ip)
+                            host_ip = refreshed_ip
+                            new_netloc = parsed.netloc.replace(hostname, host_ip)
+                            connection_url = parsed._replace(netloc=new_netloc).geturl()
+                    except Exception:
+                        # Keep retrying with current connection_url.
+                        pass
+
+            if not self.pool:
+                logger.error(
+                    "Database connection failed after %d attempts. Last error: %s",
+                    max_attempts,
+                    last_error,
                 )
-                logger.info("Database connected successfully")
-            except Exception as e:
-                logger.error("Database connection failed: %s", e, exc_info=True)
-                raise
+                raise last_error
             
     async def disconnect(self) -> None:
         """Close connection pool."""
@@ -71,6 +106,17 @@ class Database:
             await self.pool.close()
             self.pool = None
             logger.info("Database disconnected")
+
+    async def ping(self) -> bool:
+        """Run a tiny query to keep the DB connection path warm."""
+        if not self.pool or getattr(self.pool, "_closed", False):
+            return False
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.fetchval("SELECT 1")
+            return True
+        except Exception:
+            return False
             
     # --- Configuration & Users ---
 
@@ -96,6 +142,150 @@ class Database:
             row = await conn.fetchrow("SELECT * FROM profiles WHERE id = $1", user_id)
             if row: return dict(row)
             return None
+
+    async def get_integration(self, user_id: UUID, provider: str) -> Optional[Dict[str, Any]]:
+        """Fetch a single integration row for a user/provider pair."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, user_id, provider, access_token, refresh_token, expires_at,
+                       created_at, updated_at
+                FROM integrations
+                WHERE user_id = $1 AND provider = $2
+                """,
+                user_id,
+                provider.lower(),
+            )
+            return dict(row) if row else None
+
+    async def upsert_integration_tokens(
+        self,
+        user_id: UUID,
+        provider: str,
+        access_token: str,
+        refresh_token: Optional[str] = None,
+        expires_at: Optional[datetime] = None,
+    ) -> None:
+        """Insert/update integration credentials for a provider."""
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO integrations (user_id, provider, access_token, refresh_token, expires_at)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (user_id, provider)
+                DO UPDATE SET
+                    access_token = EXCLUDED.access_token,
+                    refresh_token = COALESCE(EXCLUDED.refresh_token, integrations.refresh_token),
+                    expires_at = EXCLUDED.expires_at,
+                    updated_at = NOW()
+                """,
+                user_id,
+                provider.lower(),
+                access_token,
+                refresh_token,
+                expires_at,
+            )
+
+    async def create_email_draft(
+        self,
+        user_id: UUID,
+        domain_key: str,
+        session_id: str,
+        draft_payload: Dict[str, Any],
+    ) -> UUID:
+        """Create a new pending email draft using EAV entities model."""
+        async with self.pool.acquire() as conn:
+            draft_id = await conn.fetchval(
+                """
+                INSERT INTO entities (user_id, entity_type, display_name, status, data)
+                VALUES (
+                    $1,
+                    'email_draft',
+                    'Email Draft',
+                    'pending_approval',
+                    $2::jsonb
+                )
+                RETURNING id
+                """,
+                user_id,
+                json.dumps(
+                    {
+                        "domain_key": domain_key,
+                        "session_id": session_id,
+                        "draft_payload": draft_payload,
+                    }
+                ),
+            )
+            return draft_id
+
+    async def get_pending_email_draft(self, user_id: UUID, session_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch latest pending email draft entity for a user/session."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, user_id, status, data, created_at, updated_at
+                FROM entities
+                WHERE user_id = $1
+                  AND entity_type = 'email_draft'
+                  AND status = 'pending_approval'
+                  AND data->>'session_id' = $2
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                user_id,
+                session_id,
+            )
+            if not row:
+                return None
+            out = dict(row)
+            data = out.get("data") or {}
+            if isinstance(data, str):
+                try:
+                    data = json.loads(data)
+                except json.JSONDecodeError:
+                    data = {}
+
+            out["domain_key"] = data.get("domain_key")
+            out["session_id"] = data.get("session_id")
+            out["draft_payload"] = data.get("draft_payload") if isinstance(data.get("draft_payload"), dict) else {}
+            return out
+
+    async def update_email_draft(
+        self,
+        draft_id: UUID,
+        status: str,
+        draft_payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Update status and optionally payload for an email draft entity."""
+        async with self.pool.acquire() as conn:
+            if draft_payload is None:
+                await conn.execute(
+                    """
+                    UPDATE entities
+                    SET status = $1,
+                        updated_at = NOW(),
+                        version = version + 1
+                    WHERE id = $2
+                      AND entity_type = 'email_draft'
+                    """,
+                    status,
+                    draft_id,
+                )
+            else:
+                await conn.execute(
+                    """
+                    UPDATE entities
+                    SET status = $1,
+                        data = jsonb_set(data, '{draft_payload}', $2::jsonb, true),
+                        updated_at = NOW(),
+                        version = version + 1
+                    WHERE id = $3
+                      AND entity_type = 'email_draft'
+                    """,
+                    status,
+                    json.dumps(draft_payload),
+                    draft_id,
+                )
             
     # --- Tasks (Main & Agent) ---
 

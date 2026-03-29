@@ -1,0 +1,36 @@
+name: DB Keepalive
+
+on:
+  schedule:
+    # Every 12 hours (sufficient for inactivity-based pause prevention, less noisy)
+    - cron: "0 */12 * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Validate required secret
+        env:
+          KEEPALIVE_URL: ${{ secrets.KEEPALIVE_URL }}
+        run: |
+          if [ -z "$KEEPALIVE_URL" ]; then
+            echo "KEEPALIVE_URL secret is missing"
+            exit 1
+          fi
+
+      - name: Ping keepalive endpoint
+        env:
+          KEEPALIVE_URL: ${{ secrets.KEEPALIVE_URL }}
+          KEEPALIVE_TOKEN: ${{ secrets.KEEPALIVE_TOKEN }}
+        run: |
+          set -e
+          if [ -n "$KEEPALIVE_TOKEN" ]; then
+            curl -fsS \
+              -H "X-Keepalive-Token: $KEEPALIVE_TOKEN" \
+              "$KEEPALIVE_URL"
+          else
+            curl -fsS "$KEEPALIVE_URL"
+          fi
+          echo "Keepalive ping succeeded"

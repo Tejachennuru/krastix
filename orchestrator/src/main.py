@@ -2,10 +2,15 @@ import asyncio
 import json
 import logging
 import os
+import re
+import uuid
+from urllib.parse import urlencode
 from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import Header
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional, List, Any
@@ -14,9 +19,11 @@ from contextlib import asynccontextmanager
 import jwt
 from passlib.context import CryptContext
 import httpx
+from langchain_ollama import ChatOllama
 
 from shared.database import db
 from shared.mq import celery_app
+from shared.integrations_crypto import encrypt_secret, decrypt_secret
 from orchestrator.src.graph import OrchestratorGraph
 from orchestrator.src.services.memory import MemoryService
 
@@ -31,6 +38,20 @@ if not JWT_SECRET:
     JWT_SECRET = "krastix-insecure-default-secret-CHANGE-ME"
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_DAYS = 7
+
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REDIRECT_URI = os.getenv(
+    "GOOGLE_REDIRECT_URI",
+    "http://localhost:8000/api/v1/integrations/google/oauth/callback",
+)
+GOOGLE_OAUTH_SCOPES = [
+    "https://mail.google.com/",
+    "openid",
+    "email",
+    "profile",
+]
+KEEPALIVE_TOKEN = os.getenv("KEEPALIVE_TOKEN", "").strip()
 
 import bcrypt
 
@@ -122,6 +143,17 @@ def _build_task_history_message(task_id: str, status: str, result: Any, error: O
 
             return "\n".join(lines)
 
+        if action == "send_email":
+            to_items = payload_data.get("to") if isinstance(payload_data.get("to"), list) else []
+            subject = payload_data.get("subject") or "(no subject)"
+            message_id = payload_data.get("gmail_message_id") or "(unknown id)"
+            return (
+                "✅ Agent Task Complete!\n\n"
+                f"Email sent successfully to {', '.join(to_items) if to_items else '(recipient unknown)'}.\n"
+                f"Subject: {subject}\n"
+                f"Gmail Message ID: {message_id}"
+            )
+
         form_url = payload_data.get("form_url")
         if form_url:
             form_title = payload_data.get("form_title") or "Application"
@@ -138,6 +170,246 @@ def _build_task_history_message(task_id: str, status: str, result: Any, error: O
             return "\n".join(lines)
 
     return f"SYSTEM NOTIFICATION: Task {task_id} is complete. Summary of result: {str(result)[:500]}..."
+
+
+def _normalize_email_list(values: Any) -> List[str]:
+    if not isinstance(values, list):
+        return []
+    out = []
+    seen = set()
+    for item in values:
+        text = str(item).strip().lower()
+        if not text or "@" not in text:
+            continue
+        if text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
+
+def _parse_json_object(raw_text: str) -> dict:
+    if not raw_text:
+        return {}
+    text = raw_text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                return json.loads(text[start : end + 1])
+            except json.JSONDecodeError:
+                return {}
+    return {}
+
+
+def _extract_all_emails(text: str) -> List[str]:
+    found = re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text or "")
+    deduped = []
+    seen = set()
+    for email in found:
+        k = email.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        deduped.append(k)
+    return deduped
+
+
+def _is_email_intent(text: str) -> bool:
+    t = (text or "").lower()
+    has_keyword = any(k in t for k in ["email", "mail", "gmail", "send", "draft", "cc", "bcc"])
+    has_recipient = "@" in t
+    return has_keyword and has_recipient
+
+
+def _review_action(text: str) -> str:
+    t = (text or "").strip().lower()
+    if re.search(r"\b(reject|cancel|discard|don'?t send|do not send|abort)\b", t):
+        return "reject"
+    if re.search(r"\b(accept|approve|confirm|send now|looks good|go ahead|yes send|send it)\b", t):
+        return "accept"
+    return "modify"
+
+
+def _format_draft_message(draft: dict) -> str:
+    to_items = ", ".join(draft.get("to", [])) or "(missing)"
+    cc_items = ", ".join(draft.get("cc", [])) or "(none)"
+    bcc_items = ", ".join(draft.get("bcc", [])) or "(none)"
+    subject = draft.get("subject") or "(no subject)"
+    body = draft.get("body") or ""
+    return (
+        "Draft ready for your review:\n\n"
+        f"To: {to_items}\n"
+        f"CC: {cc_items}\n"
+        f"BCC: {bcc_items}\n"
+        f"Subject: {subject}\n\n"
+        "Body:\n"
+        f"{body}\n\n"
+        "Reply with one option: accept, modify <changes>, or reject."
+    )
+
+
+def _build_draft_model() -> ChatOllama:
+    ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://100.115.107.20:11434").rstrip("/")
+    model_name = os.getenv("OLLAMA_MODEL", "qwen2.5:14b-instruct-q5_K_M")
+    return ChatOllama(model=model_name, base_url=ollama_base_url, temperature=0, timeout=120.0)
+
+
+async def _llm_generate_email_draft(message: str, sender_email: str) -> dict:
+    model = _build_draft_model()
+    prompt = (
+        "You are an email drafting assistant. Return strict JSON with keys: "
+        "to (array), cc (array), bcc (array), subject (string), body (string). "
+        "Do not include markdown. Infer recipients from prompt. "
+        "If cc/bcc are explicitly requested, include them. "
+        f"Sender email is {sender_email}.\n\n"
+        f"User instruction:\n{message}"
+    )
+    response = await model.ainvoke(prompt)
+    parsed = _parse_json_object(response.content if hasattr(response, "content") else str(response))
+
+    recipients = _extract_all_emails(message)
+    to_items = _normalize_email_list(parsed.get("to", [])) or recipients[:1]
+    cc_items = _normalize_email_list(parsed.get("cc", []))
+    bcc_items = _normalize_email_list(parsed.get("bcc", []))
+
+    # If the prompt says CC/BCC explicitly and model omitted them, heuristically fill from extra emails.
+    remaining = [e for e in recipients if e not in to_items and e not in cc_items and e not in bcc_items]
+    lower_msg = (message or "").lower()
+    if "cc" in lower_msg and not cc_items and remaining:
+        cc_items.append(remaining.pop(0))
+    if "bcc" in lower_msg and not bcc_items and remaining:
+        bcc_items.append(remaining.pop(0))
+
+    subject = str(parsed.get("subject") or "Regarding your request").strip()
+    body = str(parsed.get("body") or "").strip()
+
+    return {
+        "to": to_items,
+        "cc": cc_items,
+        "bcc": bcc_items,
+        "subject": subject,
+        "body": body,
+    }
+
+
+async def _llm_modify_email_draft(existing: dict, instruction: str, sender_email: str) -> dict:
+    model = _build_draft_model()
+    prompt = (
+        "You are editing an existing email draft. Return strict JSON with keys: "
+        "to (array), cc (array), bcc (array), subject (string), body (string). "
+        "Apply user modification request precisely. Do not return markdown.\n\n"
+        f"Sender email: {sender_email}\n"
+        f"Current draft JSON: {json.dumps(existing)}\n"
+        f"Modification request: {instruction}"
+    )
+    response = await model.ainvoke(prompt)
+    parsed = _parse_json_object(response.content if hasattr(response, "content") else str(response))
+    merged = {
+        "to": _normalize_email_list(parsed.get("to", existing.get("to", []))),
+        "cc": _normalize_email_list(parsed.get("cc", existing.get("cc", []))),
+        "bcc": _normalize_email_list(parsed.get("bcc", existing.get("bcc", []))),
+        "subject": str(parsed.get("subject", existing.get("subject", ""))).strip(),
+        "body": str(parsed.get("body", existing.get("body", ""))).strip(),
+    }
+    if not merged["to"]:
+        merged["to"] = existing.get("to", [])
+    return merged
+
+
+async def _get_google_integration(user_id: str) -> Optional[dict]:
+    row = await db.get_integration(uuid.UUID(user_id), "google")
+    if not row:
+        return None
+    token = decrypt_secret(row.get("access_token"))
+    if not token:
+        return None
+    return row
+
+
+async def _handle_email_draft_flow(user_id: str, domain: str, message: str, session_id: str) -> Optional[dict]:
+    if domain not in {"HR_RECRUITER", "PERSONAL_ASSISTANT"}:
+        return None
+
+    user_uuid = uuid.UUID(user_id)
+    pending = await db.get_pending_email_draft(user_uuid, session_id)
+
+    if pending:
+        action = _review_action(message)
+        draft_id = pending["id"]
+        draft_payload = pending.get("draft_payload") or {}
+        profile = await db.get_user_profile(user_uuid)
+        sender_email = (profile or {}).get("email", "")
+
+        if action == "reject":
+            await db.update_email_draft(draft_id, "rejected")
+            return {"response": "Draft rejected. No email was sent.", "task_id": None}
+
+        if action == "accept":
+            integration = await _get_google_integration(user_id)
+            if not integration:
+                return {
+                    "response": "Google sign-in is required before sending email. Open App Integrations and connect Google.",
+                    "task_id": None,
+                }
+
+            task_id = await db.create_task(
+                user_id=user_uuid,
+                domain_key=domain,
+                agent_queue="communication_queue",
+                input_payload={
+                    "instruction": "Send approved email draft",
+                    "task_action": "send_email",
+                    "parameters": draft_payload,
+                    "priority": 1,
+                    "session_id": session_id,
+                },
+            )
+            celery_app.send_task(
+                "agents.communication_worker.execute_task",
+                args=[str(task_id)],
+                queue="communication_queue",
+            )
+            await db.update_email_draft(draft_id, "approved")
+            return {
+                "response": "Approved. I delegated this to the communication agent and it will send from your connected Google account.",
+                "task_id": str(task_id),
+            }
+
+        updated = await _llm_modify_email_draft(draft_payload, message, sender_email)
+        await db.update_email_draft(draft_id, "pending_approval", updated)
+        return {"response": _format_draft_message(updated), "task_id": None}
+
+    if not _is_email_intent(message):
+        return None
+
+    integration = await _get_google_integration(user_id)
+    if not integration:
+        return {
+            "response": "To draft and send email, connect Google first from App Integrations. After sign-in, send your instruction again.",
+            "task_id": None,
+        }
+
+    profile = await db.get_user_profile(user_uuid)
+    sender_email = (profile or {}).get("email", "")
+    draft = await _llm_generate_email_draft(message, sender_email)
+
+    if not draft.get("to"):
+        return {
+            "response": "I could not find a recipient email address. Please include at least one recipient in your prompt.",
+            "task_id": None,
+        }
+
+    await db.create_email_draft(
+        user_id=user_uuid,
+        domain_key=domain,
+        session_id=session_id,
+        draft_payload=draft,
+    )
+    return {"response": _format_draft_message(draft), "task_id": None}
 
 
 # --- Task Watcher (safety net for fire-and-forget) ---
@@ -304,6 +576,26 @@ async def health_check():
 
     return health_status
 
+
+@app.get("/health/keepalive")
+async def keepalive_ping(x_keepalive_token: Optional[str] = Header(default=None)):
+    """
+    Lightweight endpoint for external cron pings to keep DB path warm.
+    If KEEPALIVE_TOKEN is configured, caller must send it in X-Keepalive-Token.
+    """
+    if KEEPALIVE_TOKEN:
+        if not x_keepalive_token or x_keepalive_token != KEEPALIVE_TOKEN:
+            raise HTTPException(status_code=401, detail="Unauthorized keepalive token")
+
+    ok = await db.ping()
+    if not ok:
+        raise HTTPException(status_code=503, detail="Database ping failed")
+
+    return {
+        "status": "ok",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
 # --- Auth Models ---
 class RegisterRequest(BaseModel):
     email: str
@@ -361,21 +653,23 @@ class IntegrationRequest(BaseModel):
     user_id: str
     provider: str
     access_token: str
+    refresh_token: Optional[str] = None
+    expires_at: Optional[datetime] = None
 
 @app.post("/api/v1/integrations")
 async def save_integration(req: IntegrationRequest):
     """Save an access token securely for a third-party app (Tally, Jotform)"""
     if not db.pool:
         raise HTTPException(503, "Database not available")
-    import uuid
-    async with db.pool.acquire() as conn:
-        await conn.execute(
-            """INSERT INTO integrations (user_id, provider, access_token) 
-               VALUES ($1, $2, $3) 
-               ON CONFLICT (user_id, provider) 
-               DO UPDATE SET access_token = EXCLUDED.access_token, updated_at = NOW()""",
-            uuid.UUID(req.user_id), req.provider.lower(), req.access_token
-        )
+    encrypted_access = encrypt_secret(req.access_token)
+    encrypted_refresh = encrypt_secret(req.refresh_token) if req.refresh_token else None
+    await db.upsert_integration_tokens(
+        user_id=uuid.UUID(req.user_id),
+        provider=req.provider.lower(),
+        access_token=encrypted_access,
+        refresh_token=encrypted_refresh,
+        expires_at=req.expires_at,
+    )
     return {"status": "success", "provider": req.provider.lower()}
 
 @app.get("/api/v1/integrations/{user_id}")
@@ -391,6 +685,118 @@ async def list_integrations(user_id: str):
     except Exception as e:
         logger.error(f"Error listing integrations: {e}")
         return []
+
+
+@app.get("/api/v1/integrations/google/oauth/start")
+async def google_oauth_start(user_id: str):
+    """Start Google OAuth 2.0 authorization code flow."""
+    missing = []
+    if not GOOGLE_CLIENT_ID:
+        missing.append("GOOGLE_CLIENT_ID")
+    if not GOOGLE_CLIENT_SECRET:
+        missing.append("GOOGLE_CLIENT_SECRET")
+    if not GOOGLE_REDIRECT_URI:
+        missing.append("GOOGLE_REDIRECT_URI")
+
+    if missing:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": "Google OAuth is not configured",
+                "missing": missing,
+            },
+        )
+
+    state_token = jwt.encode(
+        {
+            "sub": user_id,
+            "purpose": "google_oauth",
+            "exp": datetime.now(timezone.utc) + timedelta(minutes=15),
+        },
+        JWT_SECRET,
+        algorithm=JWT_ALGORITHM,
+    )
+
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": GOOGLE_REDIRECT_URI,
+        "response_type": "code",
+        "scope": " ".join(GOOGLE_OAUTH_SCOPES),
+        "access_type": "offline",
+        "include_granted_scopes": "true",
+        "prompt": "consent",
+        "state": state_token,
+    }
+    auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
+    return {"auth_url": auth_url}
+
+
+@app.get("/api/v1/integrations/google/oauth/callback", response_class=HTMLResponse)
+async def google_oauth_callback(code: Optional[str] = None, state: Optional[str] = None, error: Optional[str] = None):
+    """Handle Google OAuth callback and persist encrypted tokens."""
+    if error:
+        html = (
+            "<html><body><script>"
+            "window.opener && window.opener.postMessage({type:'google-oauth-complete', success:false, error:'" + error + "'}, '*');"
+            "window.close();"
+            "</script>Authorization failed. You can close this window.</body></html>"
+        )
+        return HTMLResponse(content=html)
+
+    if not code or not state:
+        raise HTTPException(400, "Missing OAuth callback parameters")
+
+    try:
+        payload = jwt.decode(state, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        if payload.get("purpose") != "google_oauth":
+            raise HTTPException(400, "Invalid OAuth state")
+        user_id = payload.get("sub")
+        uuid.UUID(str(user_id))
+    except Exception as exc:
+        raise HTTPException(400, f"Invalid OAuth state: {exc}")
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        token_resp = await client.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "code": code,
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "redirect_uri": GOOGLE_REDIRECT_URI,
+                "grant_type": "authorization_code",
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        if token_resp.status_code != 200:
+            logger.error("Google token exchange failed: %s", token_resp.text)
+            raise HTTPException(400, "Google token exchange failed")
+        token_json = token_resp.json()
+
+    access_token = token_json.get("access_token")
+    refresh_token = token_json.get("refresh_token")
+    expires_in = token_json.get("expires_in")
+    expires_at = None
+    if isinstance(expires_in, int):
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+
+    if not access_token:
+        raise HTTPException(400, "Google did not return an access token")
+
+    await db.upsert_integration_tokens(
+        user_id=uuid.UUID(str(user_id)),
+        provider="google",
+        access_token=encrypt_secret(access_token),
+        refresh_token=encrypt_secret(refresh_token) if refresh_token else None,
+        expires_at=expires_at,
+    )
+
+    html = (
+        "<html><body><script>"
+        "window.opener && window.opener.postMessage({type:'google-oauth-complete', success:true}, '*');"
+        "window.close();"
+        "</script>Google connected successfully. You can close this window.</body></html>"
+    )
+    return HTMLResponse(content=html)
 
 
 @app.get("/api/v1/forms/tally/{user_id}")
@@ -409,7 +815,11 @@ async def list_tally_forms(user_id: str):
         if not row or not row["access_token"]:
             return {"status": "not_connected", "forms": []}
 
-        headers = {"Authorization": f"Bearer {row['access_token']}"}
+        access_token = decrypt_secret(row["access_token"])
+        if not access_token:
+            return {"status": "not_connected", "forms": []}
+
+        headers = {"Authorization": f"Bearer {access_token}"}
         async with httpx.AsyncClient(timeout=20.0) as client:
             resp = await client.get("https://api.tally.so/forms", headers=headers)
             if resp.status_code != 200:
@@ -528,6 +938,20 @@ async def chat_endpoint(req: ChatRequest):
     """
     if not brain: raise HTTPException(503, "Brain not initialized")
 
+    email_flow = await _handle_email_draft_flow(
+        user_id=req.user_id,
+        domain=req.domain,
+        message=req.message,
+        session_id=req.session_id,
+    )
+    if email_flow is not None:
+        try:
+            await db.save_message(req.user_id, "user", req.message, req.session_id, req.domain)
+            await db.save_message(req.user_id, "assistant", str(email_flow["response"]), req.session_id, req.domain)
+        except Exception as e:
+            logger.warning("Failed to save audit log for email flow: %s", e)
+        return email_flow
+
     result = await brain.process_message(
         user_id=req.user_id,
         domain=req.domain,
@@ -608,6 +1032,36 @@ async def chat_stream_endpoint(req: ChatRequest):
     """
     if not brain:
         raise HTTPException(503, "Brain not initialized")
+
+    email_flow = await _handle_email_draft_flow(
+        user_id=req.user_id,
+        domain=req.domain,
+        message=req.message,
+        session_id=req.session_id,
+    )
+    if email_flow is not None:
+        async def email_event_generator():
+            try:
+                await db.save_message(req.user_id, "user", req.message, req.session_id, domain=req.domain)
+                await db.save_message(req.user_id, "assistant", str(email_flow["response"]), req.session_id, domain=req.domain)
+            except Exception as e:
+                logger.warning("Failed to save email-flow messages: %s", e)
+
+            payload = {
+                "response": email_flow.get("response", ""),
+                "task_id": email_flow.get("task_id"),
+            }
+            yield f"event: done\ndata: {json.dumps(payload)}\n\n"
+
+        return StreamingResponse(
+            email_event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     async def event_generator():
         full_response = ""

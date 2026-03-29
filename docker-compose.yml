@@ -35,6 +35,11 @@ services:
       - DATABASE_URL=${DATABASE_URL}
       - RESEARCH_AGENT_URL=http://research_agent:8001
       - DOC_AGENT_URL=http://doc_agent:8002
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET}
+      - GOOGLE_REDIRECT_URI=${GOOGLE_REDIRECT_URI}
+      - INTEGRATIONS_ENCRYPTION_KEY=${INTEGRATIONS_ENCRYPTION_KEY}
+      - KEEPALIVE_TOKEN=${KEEPALIVE_TOKEN}
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
       - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
@@ -66,6 +71,7 @@ services:
       - DATABASE_URL=${DATABASE_URL}
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      - INTEGRATIONS_ENCRYPTION_KEY=${INTEGRATIONS_ENCRYPTION_KEY}
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL}
       - OLLAMA_MODEL=${OLLAMA_MODEL}
       - ORCHESTRATOR_URL=http://orchestrator:8000
@@ -119,6 +125,7 @@ services:
       - DATABASE_URL=${DATABASE_URL}
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      - INTEGRATIONS_ENCRYPTION_KEY=${INTEGRATIONS_ENCRYPTION_KEY}
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL}
       - OLLAMA_MODEL=${OLLAMA_MODEL}
       - ORCHESTRATOR_URL=http://orchestrator:8000
@@ -130,6 +137,33 @@ services:
       - ./shared:/app/shared
     # Include agent.src.worker to register its tasks (assuming it has them)
     command: celery -A shared.mq:celery_app worker --loglevel=info -Q form_queue --include=agent.src.worker
+
+  # -----------------------------
+  # Agent 5: Communication (Gmail)
+  # -----------------------------
+  communication_agent:
+    build:
+      context: .
+      dockerfile: agents/communication_agent/Dockerfile
+    container_name: krastix-communication-agent
+    restart: on-failure
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=${DATABASE_URL}
+      - ORCHESTRATOR_URL=http://orchestrator:8000
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET}
+      - INTEGRATIONS_ENCRYPTION_KEY=${INTEGRATIONS_ENCRYPTION_KEY}
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./agents/communication_agent:/app/agent
+      - ./shared:/app/shared
+    command: celery -A shared.mq:celery_app worker --loglevel=info -Q communication_queue --include=agent.src.worker
 
   # -----------------------------
   # Frontend (React + Vite)

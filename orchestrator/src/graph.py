@@ -379,6 +379,7 @@ class OrchestratorGraph:
                         legacy_map = {
                             "crm_queue": "agents.crm_worker.execute_task",
                             "form_queue": "agents.form_worker.execute_task",
+                            "communication_queue": "agents.communication_worker.execute_task",
                         }
                         task_name = legacy_map.get(queue, "agents.perform_task")
                         celery_app.send_task(task_name, args=[str(task_id)], queue=queue)

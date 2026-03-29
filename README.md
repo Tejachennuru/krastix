@@ -55,6 +55,17 @@ REDIS_URL=redis://redis:6379/0
 FIRECRAWL_API_KEY=fc_...
 SCRAPECREATORS_API_KEY=...
 
+# Google OAuth (Communication Agent)
+GOOGLE_CLIENT_ID=...
+GOOGLE_CLIENT_SECRET=...
+GOOGLE_REDIRECT_URI=http://localhost:8000/api/v1/integrations/google/oauth/callback
+
+# Integration secret encryption (Fernet key, generate once and keep private)
+INTEGRATIONS_ENCRYPTION_KEY=...
+
+# Optional keepalive token for external cron pings
+KEEPALIVE_TOKEN=...
+
 # Supabase Auth (optional)
 SUPABASE_URL=https://xxx.supabase.co
 SUPABASE_ANON_KEY=...
@@ -73,6 +84,8 @@ Or for existing databases, apply the incremental migration:
 
 ```bash
 psql "$DATABASE_URL" -f migrations/002_universal_engine.sql
+psql "$DATABASE_URL" -f migrations/003_doc_agent.sql
+psql "$DATABASE_URL" -f migrations/004_communication_agent.sql
 ```
 
 ### 3. Start Services
@@ -91,6 +104,7 @@ This starts 6 containers:
 | Doc Agent | krastix-doc-agent | 8002 | Document extraction (Groq Vision + LangGraph) |
 | CRM Agent | krastix-crm-agent | — | Entity management (Celery) |
 | Form Agent | krastix-form-agent | — | Tally.so forms (Celery) |
+| Communication Agent | krastix-communication-agent | — | Gmail send after draft approval (Celery) |
 
 ### 4. Verify
 
@@ -154,6 +168,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full system diagram, database sch
 | `POST` | `/memory/ingest` | Ingest text into semantic memory |
 | `POST` | `/api/v1/batch/process` | Process pending batch jobs |
 | `GET` | `/health` | Health check |
+| `GET` | `/health/keepalive` | Lightweight DB keepalive ping (optional token via `X-Keepalive-Token`) |
 
 #### POST `/api/v1/chat`
 
@@ -219,6 +234,37 @@ The frontend connects via `fetch()` + `ReadableStream` and falls back to `/api/v
 ```
 
 Supported `task_type` values: `GENERAL_SEARCH`, `QUICK_SCRAPE`, `SITE_MAP`, `LINKEDIN_PROFILE`
+
+---
+
+## Keeping Free-Tier DB Warm (GitHub Actions)
+
+This repo includes a scheduler at [.github/workflows/db-keepalive.yml](.github/workflows/db-keepalive.yml) that pings your backend every 12 hours.
+
+### 1. Expose your backend URL
+
+Your backend must be reachable from GitHub-hosted runners (public URL or tunneled URL).
+
+### 2. Set GitHub repository secrets
+
+Go to GitHub -> Settings -> Secrets and variables -> Actions -> New repository secret:
+
+- `KEEPALIVE_URL`: full keepalive endpoint URL, for example `https://your-domain/api/v1/health/keepalive`
+- `KEEPALIVE_TOKEN` (optional but recommended): token that matches `KEEPALIVE_TOKEN` in your backend `.env`
+
+### 3. Set backend token (optional)
+
+In your backend `.env`:
+
+```ini
+KEEPALIVE_TOKEN=your-random-secret
+```
+
+Restart orchestrator after changing `.env`.
+
+### 4. Verify
+
+Run the workflow manually once from Actions tab (`DB Keepalive`) and ensure it passes.
 
 ---
 

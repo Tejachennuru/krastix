@@ -339,7 +339,7 @@ Optimize for a positive candidate experience and smooth hiring workflows
 
 Operating Principle
 Autonomously manage recruitment workflows by coordinating agents, executing delegated tasks, and ensuring candidates move smoothly through each stage of the hiring process.',
-'["research_queue", "crm_queue", "form_queue"]'::jsonb),
+'["research_queue", "crm_queue", "form_queue", "communication_queue"]'::jsonb),
 
 ('PERSONAL_ASSISTANT', 'Personal Assistant',
 'You are a Personal AI Assistant (PA) designed to manage daily life operations, scheduling, communication, and task execution on behalf of the user.
@@ -400,7 +400,7 @@ Adapt to user habits, preferences, and routines over time
 
 Operating Principle
 Autonomously manage personal workflows, communications, and life logistics by planning intelligently, executing reliably, and acting as an extension of the user''s memory and decision-making.',
-'["research_queue"]'::jsonb)
+'["research_queue", "communication_queue"]'::jsonb)
 ON CONFLICT (domain_key) DO NOTHING;
 
 -- 9.2 Define the Data Rules (The Brakes)
@@ -432,8 +432,35 @@ INSERT INTO entity_definitions (entity_type, description, validation_schema) VAL
         },
         "required": ["pnr", "price"]
     }'::jsonb
+),
+(
+    'email_draft',
+    'Email draft awaiting user review with accept/modify/reject lifecycle',
+    '{
+        "type": "object",
+        "properties": {
+            "domain_key": {"type": "string"},
+            "session_id": {"type": "string"},
+            "draft_payload": {
+                "type": "object",
+                "properties": {
+                    "to": {"type": "array", "items": {"type": "string"}},
+                    "cc": {"type": "array", "items": {"type": "string"}},
+                    "bcc": {"type": "array", "items": {"type": "string"}},
+                    "subject": {"type": "string"},
+                    "body": {"type": "string"}
+                },
+                "required": ["to", "subject", "body"]
+            }
+        },
+        "required": ["session_id", "draft_payload"]
+    }'::jsonb
 )
 ON CONFLICT (entity_type) DO NOTHING;
+
+CREATE INDEX IF NOT EXISTS idx_entities_email_draft_session_status
+    ON entities (user_id, status, created_at DESC)
+    WHERE entity_type = 'email_draft';
 
 -- 9.3 Seed Agent Registry
 INSERT INTO agent_registry (agent_id, queue, capabilities, supported_domains, description, health_endpoint) VALUES
@@ -460,6 +487,14 @@ INSERT INTO agent_registry (agent_id, queue, capabilities, supported_domains, de
     '["HR_RECRUITER", "PERSONAL_ASSISTANT", "SALES_LEAD_GEN"]'::jsonb,
     'Research agent — performs web searches, scrapes pages, maps sites, and retrieves LinkedIn data.',
     'http://research_agent:8001/health'
+),
+(
+    'communication_gmail_v1',
+    'communication_queue',
+    '["send_email"]'::jsonb,
+    '["HR_RECRUITER", "PERSONAL_ASSISTANT"]'::jsonb,
+    'Communication agent — sends approved emails using Gmail OAuth from the signed-in account.',
+    NULL
 )
 ON CONFLICT (agent_id) DO UPDATE SET
     capabilities = EXCLUDED.capabilities,
