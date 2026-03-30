@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Validate required secret
+      - name: Validate and normalize DATABASE_URL
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
@@ -20,16 +20,21 @@ jobs:
             exit 1
           fi
 
+          # Remove hidden control characters and accidental wrapping quotes.
+          CLEAN_DATABASE_URL="$(printf '%s' "$DATABASE_URL" | tr -d '\000-\037\177' | sed -e 's/^"//' -e 's/"$//')"
+          if [ -z "$CLEAN_DATABASE_URL" ]; then
+            echo "DATABASE_URL is empty after normalization"
+            exit 1
+          fi
+          echo "CLEAN_DATABASE_URL=$CLEAN_DATABASE_URL" >> "$GITHUB_ENV"
+
       - name: Install PostgreSQL client
         run: |
           sudo apt-get update
           sudo apt-get install -y postgresql-client
 
       - name: Ping database directly
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
           set -e
-          CLEAN_DATABASE_URL="$(printf '%s' "$DATABASE_URL" | tr -d '\r\n' | sed -e 's/^"//' -e 's/"$//')"
           psql "$CLEAN_DATABASE_URL" -c "SELECT 1;"
           echo "Database keepalive ping succeeded"
