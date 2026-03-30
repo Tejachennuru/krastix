@@ -249,6 +249,8 @@ Go to GitHub -> Settings -> Secrets and variables -> Actions -> New repository s
 
 - `DATABASE_URL`: full PostgreSQL connection string used by your deployment
 
+Important: store `DATABASE_URL` as a single line (no wrapping quotes, no trailing newline).
+
 ### 3. Verify
 
 Run the workflow manually once from Actions tab (`DB Keepalive`) and ensure it passes.

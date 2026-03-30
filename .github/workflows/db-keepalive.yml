@@ -30,5 +30,6 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
           set -e
-          psql "$DATABASE_URL" -c "SELECT 1;"
+          CLEAN_DATABASE_URL="$(printf '%s' "$DATABASE_URL" | tr -d '\r\n' | sed -e 's/^"//' -e 's/"$//')"
+          psql "$CLEAN_DATABASE_URL" -c "SELECT 1;"
           echo "Database keepalive ping succeeded"
