@@ -239,30 +239,17 @@ Supported `task_type` values: `GENERAL_SEARCH`, `QUICK_SCRAPE`, `SITE_MAP`, `LIN
 
 ## Keeping Free-Tier DB Warm (GitHub Actions)
 
-This repo includes a scheduler at [.github/workflows/db-keepalive.yml](.github/workflows/db-keepalive.yml) that pings your backend every 12 hours.
+This repo includes a scheduler at [.github/workflows/db-keepalive.yml](.github/workflows/db-keepalive.yml) that pings your PostgreSQL database directly every 12 hours.
 
-### 1. Expose your backend URL
-
-Your backend must be reachable from GitHub-hosted runners (public URL or tunneled URL).
+This does **not** require the orchestrator app to be running.
 
 ### 2. Set GitHub repository secrets
 
 Go to GitHub -> Settings -> Secrets and variables -> Actions -> New repository secret:
 
-- `KEEPALIVE_URL`: full keepalive endpoint URL, for example `https://your-domain/api/v1/health/keepalive`
-- `KEEPALIVE_TOKEN` (optional but recommended): token that matches `KEEPALIVE_TOKEN` in your backend `.env`
+- `DATABASE_URL`: full PostgreSQL connection string used by your deployment
 
-### 3. Set backend token (optional)
-
-In your backend `.env`:
-
-```ini
-KEEPALIVE_TOKEN=your-random-secret
-```
-
-Restart orchestrator after changing `.env`.
-
-### 4. Verify
+### 3. Verify
 
 Run the workflow manually once from Actions tab (`DB Keepalive`) and ensure it passes.
 

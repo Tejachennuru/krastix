@@ -13,24 +13,22 @@ jobs:
     steps:
       - name: Validate required secret
         env:
-          KEEPALIVE_URL: ${{ secrets.KEEPALIVE_URL }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
-          if [ -z "$KEEPALIVE_URL" ]; then
-            echo "KEEPALIVE_URL secret is missing"
+          if [ -z "$DATABASE_URL" ]; then
+            echo "DATABASE_URL secret is missing"
             exit 1
           fi
 
-      - name: Ping keepalive endpoint
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      - name: Ping database directly
         env:
-          KEEPALIVE_URL: ${{ secrets.KEEPALIVE_URL }}
-          KEEPALIVE_TOKEN: ${{ secrets.KEEPALIVE_TOKEN }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
           set -e
-          if [ -n "$KEEPALIVE_TOKEN" ]; then
-            curl -fsS \
-              -H "X-Keepalive-Token: $KEEPALIVE_TOKEN" \
-              "$KEEPALIVE_URL"
-          else
-            curl -fsS "$KEEPALIVE_URL"
-          fi
-          echo "Keepalive ping succeeded"
+          psql "$DATABASE_URL" -c "SELECT 1;"
+          echo "Database keepalive ping succeeded"
