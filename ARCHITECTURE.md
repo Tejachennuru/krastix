@@ -56,8 +56,8 @@ flowchart TB
     end
 
     subgraph LLM_LAYER["Dual-LLM Layer"]
-        GROQ[Groq API<br/>llama-3.2-90b-vision<br/>Cloud · Fast · Multimodal]
-        OLLAMA[Ollama<br/>qwen2.5:14b-instruct<br/>Local · Free · Text]
+        GROQ[Groq API<br/>llama-3.2-90b-vision<br/>Cloud / Fast / Multimodal]
+        OLLAMA[Ollama<br/>qwen2.5:14b-instruct<br/>Local / Free / Text]
         EMBED[nomic-embed-text<br/>768d Embeddings]
     end
 
@@ -68,7 +68,7 @@ flowchart TB
         GMAIL[Gmail API]
     end
 
-    %% Client Flow — SSE streaming
+    %% Client Flow - SSE streaming
     FE -->|SSE Stream| API
     
     %% Brain Internal Flow
@@ -93,12 +93,12 @@ flowchart TB
     FQ --> FORM
     COMQ --> COM
     
-    %% Agent Results — ALL agents now callback
+    %% Agent Results - ALL agents now callback
     CRM -->|callback| API
     FORM -->|callback| API
     COM -->|callback| API
-    RESEARCH -->|callback + /memory/ingest| API
-    DOC -->|callback + /memory/ingest| API
+    RESEARCH -->|callback and memory ingest| API
+    DOC -->|callback and memory ingest| API
     
     %% Schema Validation
     CRM <-->|Validate against| ED
@@ -110,14 +110,14 @@ flowchart TB
     PGVECTOR --> SUPABASE
     CHECKPOINTS --> SUPABASE
     
-    %% LLM Connections — Dual strategy
+    %% LLM Connections - Dual strategy
     PLANNER --> OLLAMA
     MEMORY --> EMBED
     RESEARCH --> OLLAMA
     DOC -->|Vision extraction| GROQ
     DOC -->|Text audit/refine| OLLAMA
-    API -->|Email summarize (on-demand)| GROQ
-    API -->|Reply draft (primary)| OLLAMA
+    API -->|Email summarize on demand| GROQ
+    API -->|Reply draft primary| OLLAMA
     
     %% External API Connections
     RESEARCH --> FIRECRAWL
