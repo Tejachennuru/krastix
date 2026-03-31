@@ -7,7 +7,7 @@
 │                                    KRASTIX PLATFORM                                      │
 │                     Universal Agentic Engine — Multi-Agent AI Orchestration               │
 │                                                                                          │
-│  Dual-LLM Strategy:  Groq (cloud/vision/fast) + Ollama qwen2.5:14b (local/text/free)    │
+│  Dual-LLM Strategy:  Groq/Grok (cloud) + Ollama qwen2.5:14b (local/text/free)             │
 │  Real-Time SSE Streaming  ·  Callback + Task Watcher Reliability  ·  Registry-Driven     │
 └─────────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -38,11 +38,13 @@ flowchart TB
         REDIS[(Redis<br/>Celery Broker)]
         CQ[crm_queue]
         FQ[form_queue]
+        COMQ[communication_queue]
     end
 
     subgraph AGENTS["Specialized Agents"]
         CRM[CRM Agent<br/>Universal Entity Worker<br/>OCC + Schema Validation]
         FORM[Form Agent<br/>Celery Worker<br/>Tally Integration]
+        COM[Communication Agent<br/>Celery Worker<br/>Approved Email Send]
         RESEARCH[Research Agent :8001<br/>FastAPI + LangGraph<br/>Firecrawl + LinkedIn]
         DOC[Document Agent :8002<br/>VDU Pipeline<br/>Groq Vision + Ollama Text]
     end
@@ -63,6 +65,7 @@ flowchart TB
         FIRECRAWL[Firecrawl API]
         SCRAPE[ScrapeCreators<br/>LinkedIn API]
         TALLY[Tally.so API]
+        GMAIL[Gmail API]
     end
 
     %% Client Flow — SSE streaming
@@ -81,15 +84,19 @@ flowchart TB
     DISPATCHER -->|Celery| REDIS
     DISPATCHER -->|HTTP| RESEARCH
     DISPATCHER -->|HTTP| DOC
-    REDIS --> CQ & FQ
+    REDIS --> CQ
+    REDIS --> FQ
+    REDIS --> COMQ
     
     %% Agent Consumption
     CQ --> CRM
     FQ --> FORM
+    COMQ --> COM
     
     %% Agent Results — ALL agents now callback
     CRM -->|callback| API
     FORM -->|callback| API
+    COM -->|callback| API
     RESEARCH -->|callback + /memory/ingest| API
     DOC -->|callback + /memory/ingest| API
     
@@ -109,11 +116,15 @@ flowchart TB
     RESEARCH --> OLLAMA
     DOC -->|Vision extraction| GROQ
     DOC -->|Text audit/refine| OLLAMA
+    API -->|Email summarize (on-demand)| GROQ
+    API -->|Reply draft (primary)| OLLAMA
     
     %% External API Connections
     RESEARCH --> FIRECRAWL
     RESEARCH --> SCRAPE
     FORM --> TALLY
+    API --> GMAIL
+    COM --> GMAIL
 ```
 
 ---
@@ -130,10 +141,12 @@ The system uses two LLM providers strategically for speed and cost:
 |-----------|----------|-------|-----------|
 | **Vision extraction** (document pages) | Groq Cloud | llama-3.2-90b-vision-preview | Fast cloud inference, multimodal capability |
 | **Text analysis** (audit, refinement) | Local Ollama | qwen2.5:14b-instruct | Free, no API cost, good for structured text tasks |
+| **Email summarization** (communications panel) | xAI Grok or Groq-compatible | provider auto-detected from `GROK_API_KEY` | Keeps summaries high quality while supporting existing key formats |
+| **Reply draft generation** (communications panel) | Local Ollama primary, Groq qwen fallback | qwen2.5 local -> qwen-family cloud fallback | Resilient drafting when local Qwen endpoint is unavailable |
 | **Orchestrator planning** | Local Ollama | qwen2.5:14b-instruct | Reasoning + tool calling |
 | **Embeddings** | Local Ollama | nomic-embed-text | 768d vectors, co-located |
 
-Fallback chain: Groq Vision → local Ollama VLM → error. Text tasks always use local Ollama first.
+Fallback chain: Groq Vision -> local Ollama VLM -> error. Communications summarize auto-selects xAI/Groq based on key format. Reply draft uses Ollama first, then Groq qwen fallback.
 
 ### 3. SSE Token Streaming
 The orchestrator exposes `POST /api/v1/chat/stream` which uses LangGraph's `astream_events(v2)` to deliver LLM tokens to the frontend in real-time via Server-Sent Events. Event types: `token`, `tool_start`, `tool_result`, `done`, `error`. The frontend falls back to the non-streaming `/api/v1/chat` endpoint if SSE fails.
@@ -174,12 +187,12 @@ The `search_memory()` method accepts a mandatory `domain_key` parameter. All RAG
 ### 1. 🖥️ Client Layer
 | Component | Tech | Port | Description |
 |-----------|------|------|-------------|
-| **Frontend** | React + Vite | `5173` | Chat UI with SSE streaming, stop button, tool delegation indicators |
+| **Frontend** | React + Vite | `5173` | Chat + Communications UI (inbox list, full-email summarize, reply draft approval) |
 
 ### 2. 🧠 Orchestrator (The Brain)
 | Component | Tech | Description |
 |-----------|------|-------------|
-| **API Layer** | FastAPI | `/chat`, `/chat/stream` (SSE), `/health`, `/memory/ingest`, `/callbacks/task-completed` |
+| **API Layer** | FastAPI | `/chat`, `/chat/stream` (SSE), `/health`, `/memory/ingest`, `/callbacks/task-completed`, integrations OAuth/connect/disconnect, communications Gmail endpoints |
 | **Graph Engine** | LangGraph | Stateful workflow: Planner → Dispatcher → END |
 | **Planner Node** | Ollama (qwen2.5) | Intent recognition, RAG context + agent registry injection, tool binding |
 | **Dispatcher Node** | Registry-Driven | Routes via Celery or HTTP based on `agent_registry.dispatch_method` |
@@ -190,13 +203,14 @@ The `search_memory()` method accepts a mandatory `domain_key` parameter. All RAG
 | Component | Tech | Description |
 |-----------|------|-------------|
 | **Redis** | Redis 7 Alpine | Celery broker + result backend |
-| **Queues** | Celery | `crm_queue`, `form_queue` (research uses HTTP) |
+| **Queues** | Celery | `crm_queue`, `form_queue`, `communication_queue` (research/doc use HTTP) |
 
 ### 4. 🤖 Specialized Agents
 | Agent | Type | Port | Capabilities |
 |-------|------|------|--------------|
 | **CRM Agent** | Celery Worker | - | Universal entity CRUD with OCC + JSON Schema validation |
 | **Form Agent** | Celery Worker | - | Tally.so form creation/management |
+| **Communication Agent** | Celery Worker | - | Sends approved Gmail emails via delegated tasks |
 | **Research Agent** | FastAPI Service | `8001` | Web scraping, LinkedIn profiles, Site mapping |
 | **Doc Agent** | FastAPI Service | `8002` | PDF/image extraction via LangGraph VDU pipeline (Groq Vision + Ollama) |
 
@@ -246,6 +260,17 @@ The `search_memory()` method accepts a mandatory `domain_key` parameter. All RAG
    │                 │──────────── stale task scan ────────────────────>│
 ```
 
+### Communication Inbox and Reply Flow
+
+```
+1. Frontend calls GET /api/v1/communications/gmail/primary?user_id=...&after_ts=...
+2. Orchestrator loads + refreshes Google tokens from integrations table
+3. Orchestrator queries Gmail API and returns message list with snippet + full body
+4. User opens one email and clicks Summarize -> POST /communications/gmail/summarize
+5. User clicks Reply -> POST /communications/gmail/reply/draft (editable draft returned)
+6. User approves and sends -> POST /communications/gmail/reply/send
+```
+
 ---
 
 ## Database Schema (Key Tables)
@@ -274,6 +299,15 @@ The `search_memory()` method accepts a mandatory `domain_key` parameter. All RAG
 └──────────────────┘     └──────────────────┘     │ enabled            │
                                                   └────────────────────┘
 ┌──────────────────────┐
+│    integrations      │
+├──────────────────────┤
+│ user_id FK + provider│
+│ access_token (enc)   │
+│ refresh_token (enc)  │
+│ expires_at           │
+│ metadata (JSON)      │
+└──────────────────────┘
+┌──────────────────────┐
 │  entity_definitions  │
 ├──────────────────────┤
 │ entity_type PK       │
@@ -300,15 +334,20 @@ The `search_memory()` method accepts a mandatory `domain_key` parameter. All RAG
 │  │  crm_agent   │  │  form_agent  │  │    doc_agent         │  │
 │  │  crm_queue   │  │  form_queue  │  │       :8002          │  │
 │  └──────────────┘  └──────────────┘  └──────────────────────┘  │
-│   (Celery Workers)                    (FastAPI Service)         │
+│                                                                 │
+│  ┌──────────────────────┐                                       │
+│  │ communication_agent  │                                       │
+│  │ communication_queue  │                                       │
+│  └──────────────────────┘                                       │
+│  (Celery Workers)                    (FastAPI Services)         │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
                               │
               ┌───────────────┼───────────────┐
               ▼               ▼               ▼
 ┌───────────────────┐ ┌─────────────┐ ┌──────────────────┐
-│ Supabase          │ │ Ollama (LAN)│ │   Groq Cloud API │
-│ PostgreSQL+pgvec  │ │ :11434      │ │  (Vision + Text) │
+│ Supabase          │ │ Ollama (LAN)│ │ Groq/xAI Cloud   │
+│ PostgreSQL+pgvec  │ │ :11434      │ │ (Vision + Text)  │
 └───────────────────┘ └─────────────┘ └──────────────────┘
 ```
 
@@ -328,7 +367,7 @@ The `search_memory()` method accepts a mandatory `domain_key` parameter. All RAG
 | **Database** | PostgreSQL (Supabase) with RLS |
 | **Vector Store** | pgvector |
 | **Frontend** | React + Vite (SSE consumer) |
-| **Containers** | Docker Compose (6 services) |
+| **Containers** | Docker Compose (7 services) |
 | **Schema Validation** | JSON Schema (jsonschema lib) |
 | **Concurrency** | Optimistic Concurrency Control (version column) |
 | **Reliability** | Agent callbacks + Task Watcher background coroutine |
@@ -367,6 +406,11 @@ krastix/
 │   │   ├── Dockerfile
 │   │   ├── requirements.txt
 │   │   └── src/worker.py    # Tally.so integration
+│   │
+│   ├── communication_agent/ # ✉️ Communications
+│   │   ├── Dockerfile
+│   │   ├── requirements.txt
+│   │   └── src/worker.py    # approved Gmail send + callback
 │   │
 │   ├── research_agent/      # 🔍 Web Research
 │   │   ├── Dockerfile
@@ -423,6 +467,15 @@ GROQ_API_KEY=gsk_...           # Vision + fast text inference
 GROQ_VISION_MODEL=llama-3.2-90b-vision-preview
 GROQ_TEXT_MODEL=llama-3.3-70b-versatile
 
+# Communications summarize key (xAI/Groq compatible)
+GROK_API_KEY=gsk_or_xai_...
+
+# Google OAuth + token encryption for integrations
+GOOGLE_CLIENT_ID=...
+GOOGLE_CLIENT_SECRET=...
+GOOGLE_REDIRECT_URI=http://localhost:8000/api/v1/integrations/google/oauth/callback
+INTEGRATIONS_ENCRYPTION_KEY=...
+
 # Message Queue
 REDIS_URL=redis://localhost:6379/0
 
@@ -454,6 +507,7 @@ docker-compose up --build
 # - Frontend:       http://localhost:5173
 # - Orchestrator:   http://localhost:8000
 # - Research Agent: http://localhost:8001
+# - Doc Agent:      http://localhost:8002
 # - Redis:          localhost:6379
 ```
 
@@ -470,6 +524,9 @@ celery -A shared.mq:celery_app worker -Q crm_queue --loglevel=info
 
 # Form Worker
 celery -A shared.mq:celery_app worker -Q form_queue --loglevel=info
+
+# Communication Worker
+celery -A shared.mq:celery_app worker -Q communication_queue --loglevel=info
 ```
 
 ---
@@ -487,6 +544,7 @@ celery -A shared.mq:celery_app worker -Q form_queue --loglevel=info
 | **Optimistic Concurrency** | Lock-free concurrent agent writes; Celery auto-retry on conflict |
 | **Namespace-isolated memory** | Prevents cross-domain RAG leakage; mandatory domain_key filter |
 | **Celery for CRM/Form** | Background tasks with reliable callback on completion |
+| **Human-in-the-loop email send** | Reply drafts are generated first, then sent only after explicit user approval |
 | **FastAPI for Research/Doc** | Needs HTTP interface for direct invocation + streaming results |
 | **pgvector over Pinecone** | Cost-effective, co-located with relational data in Supabase |
 

@@ -92,12 +92,20 @@ class CommunicationWorker:
         if not row:
             raise RuntimeError("Google integration is missing")
 
-        access = decrypt_secret(row.get("access_token"))
-        refresh = decrypt_secret(row.get("refresh_token")) if row.get("refresh_token") else None
-        expires_at = row.get("expires_at")
+        access = None
+        if row.get("access_token"):
+            try:
+                access = decrypt_secret(row.get("access_token"))
+            except Exception:
+                logger.warning("Access token decryption failed for user %s", user_id)
 
-        if not access:
-            raise RuntimeError("Google access token is missing")
+        refresh = None
+        if row.get("refresh_token"):
+            try:
+                refresh = decrypt_secret(row.get("refresh_token"))
+            except Exception:
+                logger.warning("Refresh token decryption failed for user %s", user_id)
+        expires_at = row.get("expires_at")
 
         return {
             "access_token": access,
@@ -152,6 +160,15 @@ class CommunicationWorker:
         access_token = token_info["access_token"]
         refresh_token = token_info.get("refresh_token")
         expires_at = token_info.get("expires_at")
+
+        if not access_token:
+            if refresh_token:
+                token_info = await self._refresh_google_access_token(user_id, refresh_token)
+                access_token = token_info["access_token"]
+            else:
+                raise RuntimeError(
+                    "Google credentials cannot be decrypted with the current encryption key. Reconnect Google from App Integrations."
+                )
 
         if isinstance(expires_at, datetime):
             cutoff = datetime.now(timezone.utc) + timedelta(seconds=60)

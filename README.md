@@ -13,7 +13,7 @@ Krastix is a **domain-agnostic agentic engine** for building AI-powered workflow
 5. **Validates** — Enforces JSON Schema on all entity writes with optimistic concurrency
 6. **Watches** — Background Task Watcher catches stale/lost tasks as a safety net
 
-Current agents: **CRM** (universal entity management), **Form Builder** (Tally.so), **Research** (Firecrawl + LinkedIn scraping), **Doc Agent** (PDF/image extraction via Groq Vision).
+Current agents: **CRM** (universal entity management), **Form Builder** (Tally.so), **Research** (Firecrawl + LinkedIn scraping), **Doc Agent** (PDF/image extraction via Groq Vision), **Communication Agent** (approved Gmail sends via Celery).
 
 ---
 
@@ -25,6 +25,8 @@ Current agents: **CRM** (universal entity management), **Form Builder** (Tally.s
 - Ollama running on a reachable host (default: Tailscale LAN node)
 - Supabase project (PostgreSQL + pgvector)
 - Groq API key (for vision + fast text models)
+- Google OAuth credentials + integration encryption key (for Gmail connect/send)
+- GROK-compatible API key (for email summarization in Communications view)
 - API keys: Firecrawl, ScrapeCreators (for research agent)
 
 ### 1. Configure Environment
@@ -47,6 +49,10 @@ OLLAMA_MODEL=qwen2.5:14b-instruct-q5_K_M
 GROQ_API_KEY=gsk_...              # Vision + fast text inference
 GROQ_VISION_MODEL=llama-3.2-90b-vision-preview
 GROQ_TEXT_MODEL=llama-3.3-70b-versatile
+
+# Communications summarization key
+# Supports Grok/xAI key or Groq-compatible key (provider auto-detected by orchestrator)
+GROK_API_KEY=gsk_or_xai_...
 
 # Message Queue
 REDIS_URL=redis://redis:6379/0
@@ -94,7 +100,7 @@ psql "$DATABASE_URL" -f migrations/004_communication_agent.sql
 docker compose up --build -d
 ```
 
-This starts 6 containers:
+This starts 7 containers:
 
 | Service | Container | Port | Role |
 |---------|-----------|------|------|
@@ -128,19 +134,39 @@ curl -X POST http://localhost:8000/api/v1/chat \
 
 ## Architecture Overview
 
-```
-User → FastAPI Orchestrator → LangGraph (Planner → Dispatcher)
-          │ (SSE stream)            ↕              ↓
-          ▼                   Memory (pgvector)   Agent Registry
-   Token-by-token                                  ↓
-   to frontend              ┌───────────────────────┼─────────────┐
-                            ↓          ↓          ↓             ↓
-                        CRM Agent  Form Agent  Research Agent  Doc Agent
-                        (Celery)   (Celery)    (HTTP)         (HTTP/Groq)
-                            │          │          │             │
-                            └────── POST /callbacks/task-completed ─────┘
-                                       ↓
-                              PostgreSQL (Supabase + pgvector)
+```mermaid
+flowchart LR
+  U[User]
+  FE[React Frontend]
+  O[Orchestrator\nFastAPI + LangGraph]
+  MEM[(Memory\npgvector)]
+  REG[(Agent Registry)]
+  CRM[CRM Agent\nCelery]
+  FORM[Form Agent\nCelery]
+  RESEARCH[Research Agent\nHTTP]
+  DOC[Doc Agent\nHTTP]
+  COM[Communication Agent\nCelery]
+  CB[/callbacks/task-completed/]
+  GMAIL[Gmail API]
+  DB[(PostgreSQL\nSupabase)]
+
+  U --> FE
+  FE -->|SSE chat| O
+  O --> MEM
+  O --> REG
+  O --> CRM
+  O --> FORM
+  O --> RESEARCH
+  O --> DOC
+  O --> COM
+  CRM --> CB
+  FORM --> CB
+  RESEARCH --> CB
+  DOC --> CB
+  COM --> CB
+  CB --> O
+  O --> GMAIL
+  O --> DB
 ```
 
 **Key patterns:**
@@ -151,6 +177,7 @@ User → FastAPI Orchestrator → LangGraph (Planner → Dispatcher)
 - **Schema-on-Demand** — Entity types defined in `entity_definitions` with JSON Schema. New types via SQL.
 - **Optimistic Concurrency** — `version` column on entities. Concurrent writes detected and retried automatically.
 - **Namespace Isolation** — Memory searches scoped by `domain_key` to prevent cross-domain RAG leakage.
+- **Communication Workflow** — Gmail inbox list is fetched via orchestrator API, then summarize and reply draft are generated on-demand in full-email view before human approval and send.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full system diagram, database schema, and design decisions.
 
@@ -167,6 +194,12 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full system diagram, database sch
 | `POST` | `/callbacks/task-completed` | Agent callback on task completion |
 | `POST` | `/memory/ingest` | Ingest text into semantic memory |
 | `POST` | `/api/v1/batch/process` | Process pending batch jobs |
+| `GET` | `/api/v1/integrations/{user_id}` | List integration statuses |
+| `DELETE` | `/api/v1/integrations/{user_id}/{provider}` | Disconnect an integration |
+| `GET` | `/api/v1/communications/gmail/primary` | Fetch today's inbox emails (`after_ts` baseline optional) |
+| `POST` | `/api/v1/communications/gmail/summarize` | Generate on-demand email summary |
+| `POST` | `/api/v1/communications/gmail/reply/draft` | Generate editable reply draft |
+| `POST` | `/api/v1/communications/gmail/reply/send` | Send approved Gmail reply |
 | `GET` | `/health` | Health check |
 | `GET` | `/health/keepalive` | Lightweight DB keepalive ping (optional token via `X-Keepalive-Token`) |
 
@@ -212,6 +245,52 @@ The frontend connects via `fetch()` + `ReadableStream` and falls back to `/api/v
   "domain": "recruitment",
   "content": "Research results about React developers...",
   "metadata": { "source": "research_agent", "task_type": "GENERAL_SEARCH" }
+}
+```
+
+#### Communications Endpoints (Gmail)
+
+`GET /api/v1/communications/gmail/primary?user_id=<uuid>&limit=25&after_ts=<unix_seconds>`
+
+- Returns today's inbox messages (`in:inbox -in:spam -in:trash`) with full body + snippet.
+- If tokens cannot be decrypted or are missing, response includes `status` values like `reauth_required` or `not_connected`.
+
+`POST /api/v1/communications/gmail/summarize`
+
+```json
+{
+  "user_id": "uuid",
+  "subject": "Partnership Opportunity",
+  "sender": "Founder <founder@company.com>",
+  "body": "Full email body text...",
+  "snippet": "Optional snippet"
+}
+```
+
+`POST /api/v1/communications/gmail/reply/draft`
+
+```json
+{
+  "user_id": "uuid",
+  "subject": "Partnership Opportunity",
+  "sender": "Founder <founder@company.com>",
+  "body": "Full email body text...",
+  "thread_id": "gmail-thread-id",
+  "message_id_header": "<message-id@domain.com>"
+}
+```
+
+`POST /api/v1/communications/gmail/reply/send`
+
+```json
+{
+  "user_id": "uuid",
+  "to": "founder@company.com",
+  "subject": "Re: Partnership Opportunity",
+  "body": "Thanks for reaching out...",
+  "thread_id": "gmail-thread-id",
+  "in_reply_to": "<message-id@domain.com>",
+  "references": "<message-id@domain.com>"
 }
 ```
 
@@ -321,7 +400,7 @@ The CRM agent will validate all `upsert_entity` calls for type `invoice` against
 
 ```
 krastix/
-├── docker-compose.yml          # 6 services: redis, orchestrator, crm, form, research, doc
+├── docker-compose.yml          # 7 services: redis, orchestrator, crm, form, research, doc, communication
 ├── init.sql                    # Full PostgreSQL schema (entities, registry, pgvector)
 ├── migrations/                 # Incremental SQL migrations
 ├── ARCHITECTURE.md             # Detailed architecture docs
@@ -335,6 +414,7 @@ krastix/
 ├── agents/
 │   ├── crm_agent/src/worker.py       # Universal entity CRUD + OCC + callback
 │   ├── form_agent/src/worker.py      # Tally.so form management + callback
+│   ├── communication_agent/src/worker.py # Gmail send execution + callback
 │   ├── research_agent/src/           # Firecrawl + LinkedIn (FastAPI + LangGraph)
 │   └── doc_agent/src/                # PDF/image VDU pipeline (Groq Vision + Ollama)
 │       ├── llm_router.py             # Dual-LLM factory (vision→Groq, text→Ollama)
@@ -361,10 +441,11 @@ krastix/
 | API | FastAPI (async) + SSE streaming |
 | Queue | Celery + Redis 7 |
 | Database | PostgreSQL (Supabase) + pgvector |
+| Communications | Gmail API (OAuth2) + on-demand summarize/reply flow |
 | Validation | JSON Schema (jsonschema) |
 | Concurrency | Optimistic Concurrency Control |
 | Reliability | Agent callbacks + Task Watcher |
-| Containers | Docker Compose (6 services) |
+| Containers | Docker Compose (7 services) |
 | Frontend | React + Vite (SSE consumer) |
 
 ---
@@ -388,6 +469,9 @@ celery -A shared.mq:celery_app worker -Q crm_queue --loglevel=info
 
 # Form Worker
 celery -A shared.mq:celery_app worker -Q form_queue --loglevel=info
+
+# Communication Worker
+celery -A shared.mq:celery_app worker -Q communication_queue --loglevel=info
 ```
 
 ### Logs

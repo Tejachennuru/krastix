@@ -67,8 +67,98 @@ export default function ChatPage() {
   const [storedApplicants, setStoredApplicants] = useState([]);
   const [loadingStoredApplicants, setLoadingStoredApplicants] = useState(false);
   const [applicantFormFilter, setApplicantFormFilter] = useState('');
+  const [activeView, setActiveView] = useState('chat');
+  const [commSinceTs, setCommSinceTs] = useState(null);
+  const [primaryEmails, setPrimaryEmails] = useState([]);
+  const [selectedEmailId, setSelectedEmailId] = useState('');
+  const [loadingPrimaryEmails, setLoadingPrimaryEmails] = useState(false);
+  const [communicationsError, setCommunicationsError] = useState('');
+  const [emailSummary, setEmailSummary] = useState('');
+  const [summarizingEmail, setSummarizingEmail] = useState(false);
+  const [replyDraft, setReplyDraft] = useState(null);
+  const [generatingReply, setGeneratingReply] = useState(false);
+  const [sendingReply, setSendingReply] = useState(false);
 
   useEffect(() => { fetchDomains(); }, []);
+
+  useEffect(() => {
+    if (!user?.user_id) return;
+    const sinceKey = `krastix_mail_since_${user.user_id}`;
+    let since = localStorage.getItem(sinceKey);
+    if (!since) {
+      since = String(Math.floor(Date.now() / 1000));
+      localStorage.setItem(sinceKey, since);
+    }
+    setCommSinceTs(since);
+  }, [user?.user_id]);
+
+  const fetchPrimaryEmails = useCallback(async (silent = false) => {
+    if (!user?.user_id || !commSinceTs) return;
+    if (!silent) setLoadingPrimaryEmails(true);
+    setCommunicationsError('');
+
+    try {
+      const url = `${API_URL}/api/v1/communications/gmail/primary?user_id=${encodeURIComponent(user.user_id)}&limit=40&after_ts=${encodeURIComponent(commSinceTs)}`;
+      const res = await fetch(url);
+      const rawText = await res.text();
+      let data = {};
+      try {
+        data = rawText ? JSON.parse(rawText) : {};
+      } catch {
+        data = {};
+      }
+
+      if (data?.status === 'reauth_required') {
+        setPrimaryEmails([]);
+        setSelectedEmailId('');
+        setCommunicationsError(data?.message || 'Google needs to be reconnected from App Integrations.');
+        return;
+      }
+
+      if (data?.status === 'not_connected') {
+        setPrimaryEmails([]);
+        setSelectedEmailId('');
+        setCommunicationsError('Google is not connected. Open App Integrations to connect.');
+        return;
+      }
+
+      if (!res.ok || data?.status !== 'success' || !Array.isArray(data?.items)) {
+        const detail = typeof data?.detail === 'string'
+          ? data.detail
+          : typeof data?.message === 'string'
+            ? data.message
+            : rawText || 'Unable to fetch primary Gmail messages';
+        throw new Error(detail);
+      }
+
+      setPrimaryEmails(data.items);
+      setSelectedEmailId((current) => {
+        if (current && data.items.some((m) => m.id === current)) return current;
+        return '';
+      });
+    } catch (err) {
+      console.error('Failed to fetch primary Gmail messages', err);
+      setCommunicationsError(err?.message || 'Failed to fetch mail');
+    } finally {
+      if (!silent) setLoadingPrimaryEmails(false);
+    }
+  }, [user?.user_id, commSinceTs]);
+
+  useEffect(() => {
+    if (activeView !== 'communications') return;
+    if (!activeIntegrations.includes('google')) return;
+
+    fetchPrimaryEmails(false);
+    const interval = setInterval(() => {
+      fetchPrimaryEmails(true);
+    }, 15000);
+    return () => clearInterval(interval);
+  }, [activeView, activeIntegrations, fetchPrimaryEmails]);
+
+  useEffect(() => {
+    setEmailSummary('');
+    setReplyDraft(null);
+  }, [selectedEmailId]);
 
   const fetchIntegrations = async () => {
     try {
@@ -127,6 +217,12 @@ export default function ChatPage() {
       }
     }
   }, [showIntegrations]);
+
+  useEffect(() => {
+    if (user?.user_id) {
+      fetchIntegrations();
+    }
+  }, [user?.user_id]);
 
   useEffect(() => {
     if (showIntegrations && activeIntegrations.includes('tally')) {
@@ -188,6 +284,115 @@ export default function ChatPage() {
     } catch (err) {
       console.error('Failed to start Google OAuth', err);
       alert('Failed to start Google OAuth flow.');
+    }
+  };
+
+  const disconnectIntegration = async (provider) => {
+    try {
+      const res = await fetch(`${API_URL}/api/v1/integrations/${encodeURIComponent(user.user_id)}/${encodeURIComponent(provider)}`, {
+        method: 'DELETE',
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data?.detail || `Failed to disconnect ${provider}`);
+      }
+
+      await fetchIntegrations();
+
+      if (provider === 'google') {
+        setPrimaryEmails([]);
+        setSelectedEmailId('');
+        setCommunicationsError('');
+        setEmailSummary('');
+        setReplyDraft(null);
+      }
+    } catch (err) {
+      alert(err?.message || `Failed to disconnect ${provider}`);
+    }
+  };
+
+  const summarizeSelectedEmail = async () => {
+    if (!selectedEmail) return;
+    setSummarizingEmail(true);
+    try {
+      const res = await fetch(`${API_URL}/api/v1/communications/gmail/summarize`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          user_id: user.user_id,
+          subject: selectedEmail.subject || '',
+          sender: selectedEmail.from || '',
+          body: selectedEmail.full_body || '',
+          snippet: selectedEmail.snippet || '',
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data?.status !== 'success') {
+        throw new Error(data?.detail || 'Failed to summarize this email');
+      }
+      setEmailSummary(data.summary || 'Summary unavailable.');
+    } catch (err) {
+      alert(err?.message || 'Failed to summarize this email');
+    } finally {
+      setSummarizingEmail(false);
+    }
+  };
+
+  const generateReplyDraft = async () => {
+    if (!selectedEmail) return;
+    setGeneratingReply(true);
+    try {
+      const res = await fetch(`${API_URL}/api/v1/communications/gmail/reply/draft`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          user_id: user.user_id,
+          subject: selectedEmail.subject || '',
+          sender: selectedEmail.from || '',
+          body: selectedEmail.full_body || '',
+          thread_id: selectedEmail.thread_id || '',
+          message_id_header: selectedEmail.message_id_header || '',
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data?.status !== 'success' || !data?.draft) {
+        throw new Error(data?.detail || 'Failed to generate reply draft');
+      }
+      setReplyDraft(data.draft);
+    } catch (err) {
+      alert(err?.message || 'Failed to generate reply draft');
+    } finally {
+      setGeneratingReply(false);
+    }
+  };
+
+  const sendApprovedReply = async () => {
+    if (!replyDraft) return;
+    setSendingReply(true);
+    try {
+      const res = await fetch(`${API_URL}/api/v1/communications/gmail/reply/send`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          user_id: user.user_id,
+          to: replyDraft.to || '',
+          subject: replyDraft.subject || '',
+          body: replyDraft.body || '',
+          thread_id: replyDraft.thread_id || '',
+          in_reply_to: replyDraft.in_reply_to || '',
+          references: replyDraft.references || '',
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data?.status !== 'success') {
+        throw new Error(data?.detail || 'Failed to send reply');
+      }
+      alert('Reply sent successfully.');
+      setReplyDraft(null);
+    } catch (err) {
+      alert(err?.message || 'Failed to send reply');
+    } finally {
+      setSendingReply(false);
     }
   };
 
@@ -486,6 +691,7 @@ export default function ChatPage() {
   };
 
   const domainLabel = domains.find((d) => d.domain_key === selectedDomain)?.display_name || selectedDomain;
+  const selectedEmail = primaryEmails.find((m) => m.id === selectedEmailId) || null;
 
   return (
     <div className="flex h-screen bg-[#0d0d14] text-white overflow-hidden relative">
@@ -525,9 +731,25 @@ export default function ChatPage() {
                     Connect with Google
                   </button>
                 ) : (
-                  <p className="text-xs text-emerald-300">
-                    Gmail access is active. Drafts will be sent from this signed-in account after approval.
-                  </p>
+                  <div className="space-y-3">
+                    <p className="text-xs text-emerald-300">
+                      Gmail access is active. Drafts will be sent from this signed-in account after approval.
+                    </p>
+                    <div className="flex gap-2">
+                      <button
+                        onClick={connectGoogle}
+                        className="bg-white text-black font-semibold text-xs px-3 py-2 rounded-lg hover:bg-slate-200"
+                      >
+                        Reconnect Google
+                      </button>
+                      <button
+                        onClick={() => disconnectIntegration('google')}
+                        className="bg-red-500/15 border border-red-500/30 text-red-300 font-semibold text-xs px-3 py-2 rounded-lg hover:bg-red-500/25"
+                      >
+                        Disconnect
+                      </button>
+                    </div>
+                  </div>
                 )}
               </div>
 
@@ -831,7 +1053,21 @@ export default function ChatPage() {
             </h2>
             <p className="text-xs text-slate-500">Krastix Orchestrator</p>
           </div>
-          {pendingTasks.length > 0 && (
+          <div className="flex items-center gap-2 bg-[#0d0d14] border border-white/10 rounded-xl p-1">
+            <button
+              onClick={() => setActiveView('chat')}
+              className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${activeView === 'chat' ? 'bg-indigo-500/20 text-indigo-300 border border-indigo-500/30' : 'text-slate-400 hover:text-white'}`}
+            >
+              Chat
+            </button>
+            <button
+              onClick={() => setActiveView('communications')}
+              className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${activeView === 'communications' ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30' : 'text-slate-400 hover:text-white'}`}
+            >
+              Communications
+            </button>
+          </div>
+          {activeView === 'chat' && pendingTasks.length > 0 && (
             <div className="text-xs text-amber-400 flex items-center gap-1.5">
               <span className="relative flex h-2 w-2">
                 <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75" />
@@ -842,138 +1078,342 @@ export default function ChatPage() {
           )}
         </header>
 
-        {/* Messages */}
-        <div className="flex-1 overflow-y-auto px-4 py-6">
-          {messages.length === 0 ? (
-            <div className="flex flex-col items-center justify-center h-full text-center max-w-md mx-auto">
-              <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-indigo-500 to-violet-600 flex items-center justify-center shadow-xl shadow-indigo-500/30 mb-6">
-                <svg className="w-8 h-8 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z" />
-                </svg>
-              </div>
-              <h2 className="text-2xl font-bold text-white mb-2">
-                Welcome{user.full_name ? `, ${user.full_name.split(' ')[0]}` : ''}!
-              </h2>
-              <p className="text-slate-400 text-sm leading-relaxed mb-6">
-                I'm your AI orchestrator. Ask me to research candidates, manage CRM data, create forms, or anything in between.
-              </p>
-              <div className="grid grid-cols-1 gap-2 w-full">
-                {[
-                  'Find LinkedIn profiles for senior React developers',
-                  'Create a job application form for a backend engineer role',
-                  'Show me the latest candidates in the pipeline',
-                ].map((suggestion) => (
-                  <button
-                    key={suggestion}
-                    onClick={() => setInputMessage(suggestion)}
-                    className="text-left text-sm bg-white/5 hover:bg-white/8 border border-white/8 rounded-xl px-4 py-3 text-slate-300 hover:text-white transition-all"
-                  >
-                    {suggestion}
-                  </button>
-                ))}
-              </div>
-            </div>
-          ) : (
-            <div className="max-w-3xl mx-auto space-y-6">
-              {messages.map((msg, idx) => (
-                <div key={idx} className={`flex gap-3 ${msg.role === 'user' ? 'flex-row-reverse' : 'flex-row'}`}>
-                  {msg.role === 'user' ? (
-                    <UserAvatar name={user.full_name} email={user.email} />
-                  ) : (
-                    <div className="w-8 h-8 rounded-full bg-gradient-to-br from-indigo-500 to-violet-600 flex items-center justify-center flex-shrink-0">
-                      <svg className="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                        <path strokeLinecap="round" strokeLinejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z" />
-                      </svg>
+        {activeView === 'chat' ? (
+          <>
+            {/* Messages */}
+            <div className="flex-1 overflow-y-auto px-4 py-6">
+              {messages.length === 0 ? (
+                <div className="flex flex-col items-center justify-center h-full text-center max-w-md mx-auto">
+                  <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-indigo-500 to-violet-600 flex items-center justify-center shadow-xl shadow-indigo-500/30 mb-6">
+                    <svg className="w-8 h-8 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z" />
+                    </svg>
+                  </div>
+                  <h2 className="text-2xl font-bold text-white mb-2">
+                    Welcome{user.full_name ? `, ${user.full_name.split(' ')[0]}` : ''}!
+                  </h2>
+                  <p className="text-slate-400 text-sm leading-relaxed mb-6">
+                    I'm your AI orchestrator. Ask me to research candidates, manage CRM data, create forms, or anything in between.
+                  </p>
+                  <div className="grid grid-cols-1 gap-2 w-full">
+                    {[
+                      'Find LinkedIn profiles for senior React developers',
+                      'Create a job application form for a backend engineer role',
+                      'Show me the latest candidates in the pipeline',
+                    ].map((suggestion) => (
+                      <button
+                        key={suggestion}
+                        onClick={() => setInputMessage(suggestion)}
+                        className="text-left text-sm bg-white/5 hover:bg-white/8 border border-white/8 rounded-xl px-4 py-3 text-slate-300 hover:text-white transition-all"
+                      >
+                        {suggestion}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <div className="max-w-3xl mx-auto space-y-6">
+                  {messages.map((msg, idx) => (
+                    <div key={idx} className={`flex gap-3 ${msg.role === 'user' ? 'flex-row-reverse' : 'flex-row'}`}>
+                      {msg.role === 'user' ? (
+                        <UserAvatar name={user.full_name} email={user.email} />
+                      ) : (
+                        <div className="w-8 h-8 rounded-full bg-gradient-to-br from-indigo-500 to-violet-600 flex items-center justify-center flex-shrink-0">
+                          <svg className="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z" />
+                          </svg>
+                        </div>
+                      )}
+                      <div className={`max-w-[75%] ${msg.role === 'user' ? 'items-end' : 'items-start'} flex flex-col gap-1`}>
+                        <span className="text-xs text-slate-500 px-1">
+                          {msg.role === 'user' ? (user.full_name?.split(' ')[0] || 'You') : 'Krastix'}
+                        </span>
+                        <div
+                          className={`rounded-2xl px-4 py-3 text-sm leading-relaxed whitespace-pre-wrap break-words ${msg.role === 'user'
+                            ? 'bg-indigo-600 text-white rounded-tr-sm'
+                            : 'bg-[#1e1e2e] border border-white/8 text-slate-200 rounded-tl-sm'
+                            }`}
+                        >
+                          {msg.content}
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+
+                  {loading && (
+                    <div className="flex gap-3">
+                      <div className="w-8 h-8 rounded-full bg-gradient-to-br from-indigo-500 to-violet-600 flex items-center justify-center flex-shrink-0">
+                        <svg className="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z" />
+                        </svg>
+                      </div>
+                      <div className="bg-[#1e1e2e] border border-white/8 rounded-2xl rounded-tl-sm px-4 py-3">
+                        <div className="flex gap-1.5 items-center h-4">
+                          <span className="w-2 h-2 bg-indigo-400 rounded-full animate-bounce [animation-delay:0ms]" />
+                          <span className="w-2 h-2 bg-indigo-400 rounded-full animate-bounce [animation-delay:150ms]" />
+                          <span className="w-2 h-2 bg-indigo-400 rounded-full animate-bounce [animation-delay:300ms]" />
+                        </div>
+                      </div>
                     </div>
                   )}
-                  <div className={`max-w-[75%] ${msg.role === 'user' ? 'items-end' : 'items-start'} flex flex-col gap-1`}>
-                    <span className="text-xs text-slate-500 px-1">
-                      {msg.role === 'user' ? (user.full_name?.split(' ')[0] || 'You') : 'Krastix'}
-                    </span>
-                    <div
-                      className={`rounded-2xl px-4 py-3 text-sm leading-relaxed whitespace-pre-wrap break-words ${msg.role === 'user'
-                        ? 'bg-indigo-600 text-white rounded-tr-sm'
-                        : 'bg-[#1e1e2e] border border-white/8 text-slate-200 rounded-tl-sm'
-                        }`}
+
+                  {!loading && pendingTasks.length > 0 && (
+                    <div className="flex gap-3">
+                      <div className="w-8 h-8 rounded-full bg-gradient-to-br from-amber-500 to-orange-600 flex items-center justify-center flex-shrink-0 animate-pulse">
+                        <svg className="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182M2.985 19.644l3.182-3.182" />
+                        </svg>
+                      </div>
+                      <div className="bg-gradient-to-r from-amber-500/10 to-orange-500/10 border border-amber-500/20 rounded-2xl rounded-tl-sm px-4 py-3 max-w-[75%]">
+                        <div className="flex items-center gap-2 text-sm text-amber-300">
+                          <span className="relative flex h-2 w-2">
+                            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75" />
+                            <span className="relative inline-flex rounded-full h-2 w-2 bg-amber-400" />
+                          </span>
+                          <span className="font-medium">Processing background task…</span>
+                        </div>
+                        <p className="text-xs text-slate-400 mt-1">Your delegated task is running. Results will appear here automatically.</p>
+                      </div>
+                    </div>
+                  )}
+                  <div ref={messagesEndRef} />
+                </div>
+              )}
+            </div>
+
+            {/* Input Area */}
+            <div className="px-4 pb-5 pt-3 border-t border-white/8 bg-[#13131f]/50 backdrop-blur">
+              <div className="max-w-3xl mx-auto">
+                <div className="flex items-end gap-3 bg-[#1e1e2e] border border-white/10 rounded-2xl px-4 py-3 focus-within:ring-2 focus-within:ring-indigo-500/40 focus-within:border-indigo-500/40 transition-all">
+                  <textarea
+                    ref={textareaRef}
+                    value={inputMessage}
+                    onChange={(e) => { setInputMessage(e.target.value); autoResize(e); }}
+                    onKeyDown={handleKeyDown}
+                    placeholder={`Message ${domainLabel || 'AI Assistant'}…`}
+                    rows={1}
+                    className="flex-1 bg-transparent text-white text-sm placeholder-slate-600 resize-none focus:outline-none min-h-[24px] max-h-40"
+                  />
+                  <button
+                    onClick={sendMessage}
+                    disabled={loading || !inputMessage.trim()}
+                    className="w-9 h-9 flex items-center justify-center bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-700 disabled:cursor-not-allowed rounded-xl transition-all flex-shrink-0 shadow-md shadow-indigo-500/20"
+                  >
+                    <svg className="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M6 12L3.269 3.126A59.768 59.768 0 0121.485 12 59.77 59.77 0 013.27 20.876L5.999 12zm0 0h7.5" />
+                    </svg>
+                  </button>
+                </div>
+                <p className="text-center text-xs text-slate-600 mt-2">
+                  Press <kbd className="font-mono bg-white/5 px-1.5 py-0.5 rounded text-slate-500">Enter</kbd> to send,{' '}
+                  <kbd className="font-mono bg-white/5 px-1.5 py-0.5 rounded text-slate-500">Shift+Enter</kbd> for a new line.
+                </p>
+              </div>
+            </div>
+          </>
+        ) : (
+          <div className="flex-1 p-4">
+            {!activeIntegrations.includes('google') ? (
+              <div className="h-full flex items-center justify-center">
+                <div className="max-w-md w-full bg-[#161625] border border-white/10 rounded-2xl p-6 text-center">
+                  <h3 className="text-lg font-semibold text-white mb-2">Connect Gmail First</h3>
+                  <p className="text-sm text-slate-400 mb-4">
+                    Communications tab uses your Gmail inbox. Connect Google from App Integrations to start receiving Primary emails.
+                  </p>
+                  <button
+                    onClick={() => setShowIntegrations(true)}
+                    className="bg-emerald-500/20 border border-emerald-500/30 text-emerald-300 px-4 py-2 rounded-lg text-sm font-semibold hover:bg-emerald-500/30"
+                  >
+                    Open App Integrations
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="h-full border border-white/10 rounded-2xl overflow-hidden bg-[#121220] flex">
+                <div className="w-[38%] min-w-[320px] border-r border-white/10 flex flex-col">
+                  <div className="px-4 py-3 border-b border-white/10 flex items-center justify-between">
+                    <div>
+                      <p className="text-sm font-semibold text-white">Inbox Today</p>
+                      <p className="text-[11px] text-slate-500">Fast list view. Open a mail to summarize or draft a reply.</p>
+                    </div>
+                    <button
+                      onClick={() => fetchPrimaryEmails(false)}
+                      className="text-xs text-emerald-300 border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1.5 rounded-lg hover:bg-emerald-500/20"
                     >
-                      {msg.content}
-                    </div>
+                      Refresh
+                    </button>
+                  </div>
+
+                  <div className="flex-1 overflow-y-auto">
+                    {loadingPrimaryEmails && (
+                      <div className="px-4 py-4 text-sm text-slate-400">Loading emails...</div>
+                    )}
+                    {communicationsError && (
+                      <div className="mx-3 mt-3 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/30 text-xs text-red-300">
+                        <p>{communicationsError}</p>
+                        <div className="mt-2 flex gap-2">
+                          <button
+                            onClick={connectGoogle}
+                            className="text-[11px] bg-white text-black px-2.5 py-1 rounded hover:bg-slate-200"
+                          >
+                            Reconnect Google
+                          </button>
+                          <button
+                            onClick={() => disconnectIntegration('google')}
+                            className="text-[11px] bg-red-500/20 border border-red-500/35 text-red-200 px-2.5 py-1 rounded hover:bg-red-500/30"
+                          >
+                            Disconnect
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                    {!loadingPrimaryEmails && !communicationsError && primaryEmails.length === 0 && (
+                      <div className="px-4 py-6 text-center text-slate-500 text-sm">
+                        No inbox emails found for today.
+                      </div>
+                    )}
+                    {primaryEmails.map((mail) => {
+                      const active = selectedEmail?.id === mail.id;
+                      return (
+                        <button
+                          key={mail.id}
+                          onClick={() => setSelectedEmailId(mail.id)}
+                          className={`w-full text-left px-4 py-3 border-b border-white/5 transition-all ${active ? 'bg-emerald-500/10' : 'hover:bg-white/[0.04]'}`}
+                        >
+                          <div className="flex items-start gap-2">
+                            <div className={`mt-2 w-2 h-2 rounded-full ${mail.unread ? 'bg-emerald-400' : 'bg-transparent border border-slate-600'}`} />
+                            <div className="flex-1 min-w-0">
+                              <div className="flex justify-between items-start gap-3">
+                                <p className={`text-sm truncate ${mail.unread ? 'font-semibold text-white' : 'text-slate-300'}`}>
+                                  {senderLabel(mail.from)}
+                                </p>
+                                <span className="text-[11px] text-slate-500 whitespace-nowrap">{prettyMailDate(mail.internal_date_ms)}</span>
+                              </div>
+                              <p className={`text-sm truncate ${mail.unread ? 'text-slate-200 font-medium' : 'text-slate-400'}`}>{mail.subject}</p>
+                              <p
+                                className="text-xs text-slate-500 leading-relaxed"
+                                style={{
+                                  display: '-webkit-box',
+                                  WebkitLineClamp: 3,
+                                  WebkitBoxOrient: 'vertical',
+                                  overflow: 'hidden',
+                                }}
+                              >
+                                {mail.snippet || '(No preview available)'}
+                              </p>
+                            </div>
+                          </div>
+                        </button>
+                      );
+                    })}
                   </div>
                 </div>
-              ))}
 
-              {loading && (
-                <div className="flex gap-3">
-                  <div className="w-8 h-8 rounded-full bg-gradient-to-br from-indigo-500 to-violet-600 flex items-center justify-center flex-shrink-0">
-                    <svg className="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z" />
-                    </svg>
-                  </div>
-                  <div className="bg-[#1e1e2e] border border-white/8 rounded-2xl rounded-tl-sm px-4 py-3">
-                    <div className="flex gap-1.5 items-center h-4">
-                      <span className="w-2 h-2 bg-indigo-400 rounded-full animate-bounce [animation-delay:0ms]" />
-                      <span className="w-2 h-2 bg-indigo-400 rounded-full animate-bounce [animation-delay:150ms]" />
-                      <span className="w-2 h-2 bg-indigo-400 rounded-full animate-bounce [animation-delay:300ms]" />
+                <div className="flex-1 flex flex-col">
+                  {!selectedEmail ? (
+                    <div className="h-full flex items-center justify-center text-slate-500 text-sm">
+                      Select an email to view full content.
                     </div>
-                  </div>
-                </div>
-              )}
+                  ) : (
+                    <>
+                      <div className="px-6 py-4 border-b border-white/10">
+                        <h3 className="text-lg font-semibold text-white break-words">{selectedEmail.subject}</h3>
+                        <p className="text-xs text-slate-400 mt-1">From: {selectedEmail.from || 'Unknown Sender'}</p>
+                        <p className="text-xs text-slate-500 mt-1">Received: {selectedEmail.date || prettyMailDate(selectedEmail.internal_date_ms)}</p>
 
-              {/* Background task processing indicator */}
-              {!loading && pendingTasks.length > 0 && (
-                <div className="flex gap-3">
-                  <div className="w-8 h-8 rounded-full bg-gradient-to-br from-amber-500 to-orange-600 flex items-center justify-center flex-shrink-0 animate-pulse">
-                    <svg className="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182M2.985 19.644l3.182-3.182" />
-                    </svg>
-                  </div>
-                  <div className="bg-gradient-to-r from-amber-500/10 to-orange-500/10 border border-amber-500/20 rounded-2xl rounded-tl-sm px-4 py-3 max-w-[75%]">
-                    <div className="flex items-center gap-2 text-sm text-amber-300">
-                      <span className="relative flex h-2 w-2">
-                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75" />
-                        <span className="relative inline-flex rounded-full h-2 w-2 bg-amber-400" />
-                      </span>
-                      <span className="font-medium">Processing background task…</span>
-                    </div>
-                    <p className="text-xs text-slate-400 mt-1">Your delegated task is running. Results will appear here automatically.</p>
-                  </div>
-                </div>
-              )}
-              <div ref={messagesEndRef} />
-            </div>
-          )}
-        </div>
+                        <div className="mt-4 flex flex-wrap gap-2">
+                          <button
+                            onClick={summarizeSelectedEmail}
+                            disabled={summarizingEmail}
+                            className="text-xs bg-emerald-500/20 border border-emerald-500/30 text-emerald-300 px-3 py-1.5 rounded-lg hover:bg-emerald-500/30 disabled:opacity-60"
+                          >
+                            {summarizingEmail ? 'Summarizing...' : 'Summarize (Grok)'}
+                          </button>
+                          <button
+                            onClick={generateReplyDraft}
+                            disabled={generatingReply}
+                            className="text-xs bg-indigo-500/20 border border-indigo-500/30 text-indigo-300 px-3 py-1.5 rounded-lg hover:bg-indigo-500/30 disabled:opacity-60"
+                          >
+                            {generatingReply ? 'Generating Reply...' : 'Reply (Qwen 2.5)'}
+                          </button>
+                        </div>
 
-        {/* Input Area */}
-        <div className="px-4 pb-5 pt-3 border-t border-white/8 bg-[#13131f]/50 backdrop-blur">
-          <div className="max-w-3xl mx-auto">
-            <div className="flex items-end gap-3 bg-[#1e1e2e] border border-white/10 rounded-2xl px-4 py-3 focus-within:ring-2 focus-within:ring-indigo-500/40 focus-within:border-indigo-500/40 transition-all">
-              <textarea
-                ref={textareaRef}
-                value={inputMessage}
-                onChange={(e) => { setInputMessage(e.target.value); autoResize(e); }}
-                onKeyDown={handleKeyDown}
-                placeholder={`Message ${domainLabel || 'AI Assistant'}…`}
-                rows={1}
-                className="flex-1 bg-transparent text-white text-sm placeholder-slate-600 resize-none focus:outline-none min-h-[24px] max-h-40"
-              />
-              <button
-                onClick={sendMessage}
-                disabled={loading || !inputMessage.trim()}
-                className="w-9 h-9 flex items-center justify-center bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-700 disabled:cursor-not-allowed rounded-xl transition-all flex-shrink-0 shadow-md shadow-indigo-500/20"
-              >
-                <svg className="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M6 12L3.269 3.126A59.768 59.768 0 0121.485 12 59.77 59.77 0 013.27 20.876L5.999 12zm0 0h7.5" />
-                </svg>
-              </button>
-            </div>
-            <p className="text-center text-xs text-slate-600 mt-2">
-              Press <kbd className="font-mono bg-white/5 px-1.5 py-0.5 rounded text-slate-500">Enter</kbd> to send,{' '}
-              <kbd className="font-mono bg-white/5 px-1.5 py-0.5 rounded text-slate-500">Shift+Enter</kbd> for a new line.
-            </p>
+                        {emailSummary && (
+                          <div className="mt-3 bg-emerald-500/10 border border-emerald-500/25 rounded-lg px-3 py-2">
+                            <p className="text-[11px] uppercase tracking-wide text-emerald-300 font-semibold">AI Summary (Grok)</p>
+                            <p className="text-sm text-slate-200 mt-1">{emailSummary}</p>
+                          </div>
+                        )}
+
+                        {replyDraft && (
+                          <div className="mt-3 bg-indigo-500/10 border border-indigo-500/25 rounded-lg p-3">
+                            <p className="text-[11px] uppercase tracking-wide text-indigo-300 font-semibold">Reply Draft (Qwen 2.5)</p>
+                            <p className="text-[11px] text-slate-400 mt-2">To</p>
+                            <input
+                              value={replyDraft.to || ''}
+                              onChange={(e) => setReplyDraft((prev) => ({ ...prev, to: e.target.value }))}
+                              className="w-full mt-1 bg-[#0f1020] border border-white/10 rounded-md px-2 py-1.5 text-xs text-slate-200"
+                            />
+                            <p className="text-[11px] text-slate-400 mt-2">Subject</p>
+                            <input
+                              value={replyDraft.subject || ''}
+                              onChange={(e) => setReplyDraft((prev) => ({ ...prev, subject: e.target.value }))}
+                              className="w-full mt-1 bg-[#0f1020] border border-white/10 rounded-md px-2 py-1.5 text-xs text-slate-200"
+                            />
+                            <p className="text-[11px] text-slate-400 mt-2">Body</p>
+                            <textarea
+                              value={replyDraft.body || ''}
+                              onChange={(e) => setReplyDraft((prev) => ({ ...prev, body: e.target.value }))}
+                              rows={8}
+                              className="w-full mt-1 bg-[#0f1020] border border-white/10 rounded-md px-2 py-2 text-xs text-slate-200 resize-y"
+                            />
+                            <div className="mt-3 flex gap-2">
+                              <button
+                                onClick={sendApprovedReply}
+                                disabled={sendingReply}
+                                className="text-xs bg-emerald-500/20 border border-emerald-500/30 text-emerald-300 px-3 py-1.5 rounded-lg hover:bg-emerald-500/30 disabled:opacity-60"
+                              >
+                                {sendingReply ? 'Sending...' : 'Approve & Send'}
+                              </button>
+                              <button
+                                onClick={() => setReplyDraft(null)}
+                                className="text-xs bg-white/10 border border-white/15 text-slate-300 px-3 py-1.5 rounded-lg hover:bg-white/15"
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                      <div className="flex-1 overflow-y-auto px-6 py-5 text-sm text-slate-200 whitespace-pre-wrap leading-relaxed">
+                        {selectedEmail.full_body || selectedEmail.snippet || '(No readable body found)'}
+                      </div>
+                    </>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
-        </div>
+        )}
       </div>
     </div>
   );
+}
+
+function prettyMailDate(epochMs) {
+  if (!epochMs) return '';
+  const d = new Date(epochMs);
+  const now = new Date();
+  const sameDay = d.toDateString() === now.toDateString();
+  if (sameDay) {
+    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  }
+  return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+}
+
+function senderLabel(from) {
+  if (!from) return 'Unknown Sender';
+  const m = String(from).match(/^(.*?)\s*<.*>$/);
+  if (m && m[1]) return m[1].replace(/^"|"$/g, '').trim() || from;
+  return from;
 }
