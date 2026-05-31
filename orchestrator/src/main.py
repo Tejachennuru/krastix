@@ -5,10 +5,11 @@ import os
 import re
 import uuid
 import base64
+import hashlib
 from email.message import EmailMessage
 from urllib.parse import urlencode
 from datetime import datetime, timedelta, timezone
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi import Header
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,10 +25,12 @@ import httpx
 from langchain_ollama import ChatOllama
 
 from shared.database import db
+from shared.callbacks import verify_callback_signature, is_callback_signing_enabled
 from shared.mq import celery_app
 from shared.integrations_crypto import encrypt_secret, decrypt_secret
 from orchestrator.src.graph import OrchestratorGraph
 from orchestrator.src.services.memory import MemoryService
+from orchestrator.src.services.plan_engine import PlanEngine
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +84,7 @@ def _create_token(user_id: str, email: str) -> str:
 brain: Optional[OrchestratorGraph] = None
 memory_service: Optional[MemoryService] = None
 _task_watcher_handle = None
+plan_engine: Optional[PlanEngine] = None
 
 # --- Models ---
 class ChatRequest(BaseModel):
@@ -94,6 +98,17 @@ class TaskCallback(BaseModel):
     status: str
     result: Any
     error: Optional[str] = None
+
+
+def _normalize_task_status(status: str) -> str:
+    raw = (status or "").strip().lower()
+    aliases = {
+        "success": "completed",
+        "pending": "queued",
+        "processing": "running",
+        "error": "failed",
+    }
+    return aliases.get(raw, raw)
 
 class BatchTrigger(BaseModel):
     user_id: str
@@ -132,7 +147,7 @@ def _build_task_history_message(task_id: str, status: str, result: Any, error: O
     Build a deterministic assistant message to persist task outcomes in chat history.
     This guarantees critical artifacts (like form URLs) survive page reloads.
     """
-    if status != "success":
+    if status != "completed":
         return f"SYSTEM NOTIFICATION: Task {task_id} failed. Error: {error or 'Unknown error'}"
 
     if isinstance(result, dict):
@@ -973,7 +988,8 @@ async def task_watcher_loop(interval_seconds: int = 60, stale_minutes: int = 10)
     """
     Background coroutine that periodically checks for stale tasks.
     
-    Any task stuck in 'pending' or 'processing' for > stale_minutes
+    Any task stuck in active states (created/queued/dispatched/running)
+    for > stale_minutes
     gets flagged and the user's session is notified. This is the safety
     net for the callback-based pattern — if an agent crashes or the
     callback fails, this ensures no task is silently lost.
@@ -1010,6 +1026,16 @@ async def task_watcher_loop(interval_seconds: int = 60, stale_minutes: int = 10)
 
                 # Mark as stale to prevent re-processing
                 await db.mark_task_stale(task_id)
+                if plan_engine:
+                    try:
+                        await plan_engine.on_task_terminal(
+                            task_id=str(task_id),
+                            task_status="stale",
+                            result=None,
+                            error="Task marked stale by watcher",
+                        )
+                    except Exception as e:
+                        logger.warning("Failed to advance plan for stale task %s: %s", task_id, e)
 
                 # Notify user's session
                 if session_id and brain and user_id:
@@ -1042,7 +1068,7 @@ async def task_watcher_loop(interval_seconds: int = 60, stale_minutes: int = 10)
 # --- Lifecycle ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global brain, memory_service, _task_watcher_handle
+    global brain, memory_service, _task_watcher_handle, plan_engine
     logger.info("Orchestrator starting...")
     
     await db.connect()
@@ -1056,6 +1082,7 @@ async def lifespan(app: FastAPI):
         brain = OrchestratorGraph(memory_service=memory_service, db_pool=db.pool)
         await brain.initialize()  # Async init for PostgresSaver
         logger.info("Graph brain loaded with persistent checkpoints")
+        plan_engine = PlanEngine()
 
         # 3. Start Task Watcher (safety net)
         _task_watcher_handle = asyncio.create_task(task_watcher_loop())
@@ -1083,7 +1110,6 @@ app.add_middleware(
 )
 
 # --- Global Exception Handler ---
-from fastapi import Request
 from fastapi.responses import JSONResponse
 
 @app.exception_handler(Exception)
@@ -1780,8 +1806,32 @@ async def get_task_status(task_id: str, user_id: str):
     return {
         "status": res["status"],
         "result": res.get("output_result"),
-        "error": res.get("error_message")
+        "error": res.get("error_message"),
+        "plan_id": str(res["plan_id"]) if res.get("plan_id") else None,
     }
+
+
+@app.get("/plans/{plan_id}")
+async def get_plan(plan_id: str, user_id: str):
+    if not db.pool:
+        raise HTTPException(503, "Database not available")
+    plan = await db.get_plan(plan_id, user_id=user_id)
+    if not plan:
+        raise HTTPException(404, "Plan not found")
+    nodes = await db.get_plan_nodes(plan_id)
+    plan["nodes"] = nodes
+    return plan
+
+
+@app.get("/plans/{plan_id}/events")
+async def get_plan_events(plan_id: str, user_id: str, limit: int = 200):
+    if not db.pool:
+        raise HTTPException(503, "Database not available")
+    plan = await db.get_plan(plan_id, user_id=user_id)
+    if not plan:
+        raise HTTPException(404, "Plan not found")
+    events = await db.get_plan_events(plan_id, limit=limit)
+    return {"plan_id": plan_id, "events": events}
 
 @app.get("/api/v1/chat/history")
 async def get_chat_history(session_id: str, user_id: str):
@@ -1906,26 +1956,81 @@ async def chat_stream_endpoint(req: ChatRequest):
     )
 
 @app.post("/callbacks/task-completed")
-async def agent_callback(payload: TaskCallback):
+async def agent_callback(
+    request: Request,
+    x_callback_signature: Optional[str] = Header(default=None, alias="X-Callback-Signature"),
+    x_callback_timestamp: Optional[str] = Header(default=None, alias="X-Callback-Timestamp"),
+    x_callback_idempotency_key: Optional[str] = Header(default=None, alias="X-Callback-Idempotency-Key"),
+):
     """
     [The Return Path]
     1. Update DB task status.
     2. 'Wake Up' the Graph to notify the user.
     """
-    logger.info("Task %s finished: %s", payload.task_id, payload.status)
-    
-    # 1. Update Task in DB
-    # Ensure update_task_status returns the full task object (including session_id metadata)
+    raw_body = await request.body()
+    if is_callback_signing_enabled():
+        signature_ok = verify_callback_signature(
+            raw_body=raw_body,
+            signature=x_callback_signature,
+            timestamp=x_callback_timestamp,
+        )
+        if not signature_ok:
+            raise HTTPException(status_code=401, detail="Invalid callback signature")
+    elif not x_callback_signature:
+        logger.warning("Unsigned callback accepted because CALLBACK_SIGNING_SECRET is not configured")
+
+    try:
+        payload_obj = TaskCallback(**json.loads(raw_body.decode("utf-8")))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid callback payload: {exc}")
+
+    normalized_status = _normalize_task_status(payload_obj.status)
+    if not x_callback_idempotency_key:
+        raise HTTPException(status_code=400, detail="Missing callback idempotency key header")
+
+    payload_hash = hashlib.sha256(raw_body).hexdigest()
+    idempotency = await db.register_callback_idempotency(
+        task_id=payload_obj.task_id,
+        idempotency_key=x_callback_idempotency_key,
+        payload_hash=payload_hash,
+    )
+    if not idempotency.get("accepted"):
+        reason = idempotency.get("reason", "duplicate")
+        if reason == "duplicate":
+            logger.info("Ignoring duplicate callback for task %s", payload_obj.task_id)
+            return {"status": "duplicate"}
+        if reason == "unknown_task":
+            logger.warning("Callback received for unknown task: %s", payload_obj.task_id)
+            return {"status": "ignored"}
+        raise HTTPException(status_code=409, detail=f"Callback idempotency conflict: {reason}")
+
+    logger.info("Task %s finished: %s", payload_obj.task_id, normalized_status)
+
     updated_task = await db.update_task_status(
-        task_id=payload.task_id,
-        status=payload.status,
-        result=payload.result,
-        error=payload.error
+        task_id=payload_obj.task_id,
+        status=normalized_status,
+        result=payload_obj.result,
+        error=payload_obj.error,
+        error_code="agent_failed" if normalized_status == "failed" else None,
+        error_detail=payload_obj.error,
+        callback_received=True,
+        callback_idempotency_key=x_callback_idempotency_key,
     )
     
     if not updated_task:
-        logger.warning("Callback received for unknown task: %s", payload.task_id)
+        logger.warning("Callback received for unknown task: %s", payload_obj.task_id)
         return {"status": "ignored"}
+
+    if plan_engine and normalized_status in {"completed", "failed", "cancelled", "timed_out", "stale"}:
+        try:
+            await plan_engine.on_task_terminal(
+                task_id=payload_obj.task_id,
+                task_status=normalized_status,
+                result=payload_obj.result,
+                error=payload_obj.error,
+            )
+        except Exception as e:
+            logger.warning("Plan continuation failed for task %s: %s", payload_obj.task_id, e)
 
     # 2. Extract Session ID to Resume Context
     # We assume 'input_payload' or a 'metadata' column in DB stored the session_id
@@ -1946,10 +2051,10 @@ async def agent_callback(payload: TaskCallback):
     if session_id and user_id:
         try:
             persisted_msg = _build_task_history_message(
-                task_id=payload.task_id,
-                status=payload.status,
-                result=payload.result,
-                error=payload.error,
+                task_id=payload_obj.task_id,
+                status=normalized_status,
+                result=payload_obj.result,
+                error=payload_obj.error,
             )
             await db.save_message(
                 user_id=str(user_id),
@@ -1959,16 +2064,16 @@ async def agent_callback(payload: TaskCallback):
                 domain=domain or "HR_RECRUITER",
             )
         except Exception as e:
-            logger.warning("Failed to persist callback message for task %s: %s", payload.task_id, e)
+            logger.warning("Failed to persist callback message for task %s: %s", payload_obj.task_id, e)
 
     if session_id and brain:
         logger.info("Scheduling session wake-up: %s", session_id)
         asyncio.create_task(
             _wake_session_after_callback(
-                task_id=payload.task_id,
-                status=payload.status,
-                result=payload.result,
-                error=payload.error,
+                task_id=payload_obj.task_id,
+                status=normalized_status,
+                result=payload_obj.result,
+                error=payload_obj.error,
                 user_id=str(user_id),
                 domain=domain or "HR_RECRUITER",
                 session_id=str(session_id),
@@ -2027,7 +2132,7 @@ async def _wake_session_after_callback(
         return
 
     try:
-        if status == "success":
+        if status == "completed":
             sys_msg = f"SYSTEM NOTIFICATION: The task {task_id} is complete. Summary of result: {str(result)[:500]}..."
         else:
             sys_msg = f"SYSTEM NOTIFICATION: The task {task_id} FAILED. Error: {error}"

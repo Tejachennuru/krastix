@@ -15,6 +15,14 @@ class DelegateTask(BaseModel):
     instruction: str = Field(..., description="Precise instruction for the agent")
     agent_queue: str = Field(..., description="Target agent queue (must be in domain's allowed_agent_queues)")
     priority: int = Field(default=1, description="Task priority (1-5)")
+    node_key: str = Field(
+        default="",
+        description="Optional DAG node key for plan execution. If empty, orchestrator assigns one."
+    )
+    depends_on: List[str] = Field(
+        default_factory=list,
+        description="Optional list of DAG node keys this task depends on. Empty means parallel-ready."
+    )
     task_action: str = Field(
         default="",
         description="Optional explicit action for the target agent (e.g. create_form, list_forms, list_form_responses)"
@@ -70,7 +78,7 @@ def build_dispatch_map(agents: List[Dict[str, Any]]) -> Dict[str, Dict[str, str]
     """
     Build a dispatch lookup from agent registry entries.
     Returns: { queue_or_url: { "method": "celery"|"http", "task_name": "...",
-                               "http_endpoint": "...", "agent_key": "..." } }
+                               "http_endpoint": "...", "target_url": "...", "agent_key": "..." } }
     """
     dispatch = {}
     for agent in agents:
@@ -84,5 +92,6 @@ def build_dispatch_map(agents: List[Dict[str, Any]]) -> Dict[str, Dict[str, str]
             "task_name": caps.get("celery_task_name", "agents.perform_task"),
             "agent_key": agent.get("agent_key", ""),
             "http_endpoint": caps.get("http_endpoint", "/research/run"),
+            "target_url": caps.get("base_url", key),
         }
     return dispatch

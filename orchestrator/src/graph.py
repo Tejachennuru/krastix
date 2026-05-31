@@ -4,7 +4,6 @@ import traceback
 import asyncio
 import time
 import re
-import httpx
 from typing import TypedDict, List, Annotated, Optional, Dict, Any
 from uuid import UUID
 
@@ -17,8 +16,8 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from shared.database import db
-from shared.mq import celery_app
 from orchestrator.src.schemas import DelegateTask, QueueBatch, build_agent_capability_prompt, build_dispatch_map
+from orchestrator.src.services.plan_engine import PlanEngine, PlanValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +28,7 @@ class AgentState(TypedDict):
     domain: str
     messages: Annotated[List[BaseMessage], add_messages]
     current_task_id: Optional[str]
+    current_plan_id: Optional[str]
 
 
 # --- 2. The Logic Engine ---
@@ -39,6 +39,7 @@ class OrchestratorGraph:
         self._domain_cache: Dict[str, tuple] = {}
         self._agents_cache: Dict[str, tuple] = {}
         self._cache_ttl_seconds = 30
+        self.plan_engine = PlanEngine()
         
         # Initialize Ollama (Local Model)
         # Using qwen2.5:32b (or configured model)# Connect to the LLM running on 'cogaan' via Tailscale
@@ -267,10 +268,11 @@ class OrchestratorGraph:
         return "respond"
 
     async def node_dispatcher(self, state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
-        """The Hands: Executes Tool Calls using registry-driven dispatch."""
+        """Build persisted plan from tool calls and dispatch ready DAG nodes."""
         last_message = state["messages"][-1]
         tool_outputs = []
-        dispatched_task_id = None  # Track the last dispatched task_id
+        dispatched_task_id = None
+        current_plan_id = None
         
         thread_id = config.get("configurable", {}).get("thread_id", "unknown_session")
         
@@ -288,111 +290,67 @@ class OrchestratorGraph:
             domain_agents = await self._get_agents_for_domain_cached(state["domain"])
             dispatch_map = build_dispatch_map(domain_agents)
         except Exception as e:
-            logger.warning("Registry dispatch map failed, using legacy routing: %s", e)
+            logger.warning("Registry dispatch map failed: %s", e)
 
-        for tool_call in last_message.tool_calls:
-            tool_name = tool_call["name"]
-            args = tool_call["args"]
-            
-            if tool_name == "DelegateTask":
-                queue = args["agent_queue"]
-                
-                # VALIDATION: Check if queue is allowed for this domain
-                if queue not in allowed_queues:
-                    tool_outputs.append(
-                        ToolMessage(
-                            tool_call_id=tool_call["id"],
-                            content=f"ERROR: Agent queue '{queue}' is not authorized for this domain. Allowed queues: {allowed_queues}"
-                        )
-                    )
-                    continue
-                
-                # Create Task in DB with session_id for callback wake-up
-                task_id = await db.create_task(
-                    user_id=UUID(state["user_id"]),
-                    domain_key=state["domain"],
-                    agent_queue=queue,
-                    input_payload={
-                        "instruction": args["instruction"],
-                        "task_action": args.get("task_action", ""),
-                        "parameters": args.get("parameters", {}),
-                        "priority": args.get("priority", 1),
-                        "session_id": thread_id  # Critical for callback routing
-                    }
+        delegate_calls = [tc for tc in last_message.tool_calls if tc.get("name") == "DelegateTask"]
+        batch_calls = [tc for tc in last_message.tool_calls if tc.get("name") == "QueueBatch"]
+
+        if delegate_calls:
+            source_message = ""
+            for msg in reversed(state["messages"]):
+                if isinstance(msg, HumanMessage):
+                    source_message = msg.content or ""
+                    break
+            try:
+                plan = await self.plan_engine.create_plan_from_tool_calls(
+                    user_id=state["user_id"],
+                    domain=state["domain"],
+                    session_id=thread_id,
+                    source_message=source_message,
+                    tool_calls=delegate_calls,
+                    allowed_queues=allowed_queues,
                 )
-                
-                # Registry-driven dispatch
-                route = dispatch_map.get(queue)
-                
-                if route and route["method"] == "http":
-                    # Generic HTTP dispatch (research agent, doc agent, etc.)
-                    target_url = queue  # queue_or_url is the HTTP base URL
-                    endpoint = route.get("http_endpoint", "/research/run")
-                    try:
-                        async with httpx.AsyncClient(timeout=15.0) as client:
-                            resp = await client.post(
-                                f"{target_url}{endpoint}",
-                                json={
-                                    "user_id": state["user_id"],
-                                    "task_type": "GENERAL_SEARCH",
-                                    "query_or_url": args["instruction"],
-                                    "instruction": args["instruction"],
-                                    "context_metadata": {
-                                        "task_id": str(task_id),
-                                        "session_id": thread_id,
-                                        "domain_key": state["domain"]
-                                    }
-                                }
-                            )
-                            resp.raise_for_status()
-                    except Exception as e:
-                        logger.error("HTTP dispatch to %s%s failed: %s", target_url, endpoint, e)
-                elif route and route["method"] == "celery":
-                    # Celery dispatch using registry task name
-                    celery_app.send_task(
-                        route["task_name"],
-                        args=[str(task_id)],
-                        queue=queue
-                    )
-                else:
-                    # Legacy fallback: use hardcoded mapping
-                    if queue == "research_queue":
-                        research_url = os.getenv("RESEARCH_AGENT_URL", "http://localhost:8001")
-                        try:
-                            async with httpx.AsyncClient(timeout=15.0) as client:
-                                resp = await client.post(
-                                    f"{research_url}/research/run",
-                                    json={
-                                        "user_id": state["user_id"],
-                                        "task_type": "GENERAL_SEARCH",
-                                        "query_or_url": args["instruction"],
-                                        "context_metadata": {
-                                            "task_id": str(task_id),
-                                            "session_id": thread_id
-                                        }
-                                    }
-                                )
-                                resp.raise_for_status()
-                        except Exception as e:
-                            logger.error("Legacy HTTP dispatch to research agent failed: %s", e)
-                    else:
-                        legacy_map = {
-                            "crm_queue": "agents.crm_worker.execute_task",
-                            "form_queue": "agents.form_worker.execute_task",
-                            "communication_queue": "agents.communication_worker.execute_task",
-                        }
-                        task_name = legacy_map.get(queue, "agents.perform_task")
-                        celery_app.send_task(task_name, args=[str(task_id)], queue=queue)
-                
+                current_plan_id = str(plan["plan_id"])
+                await db.update_plan_status(plan_id=current_plan_id, status="running")
+                dispatch_result = await self.plan_engine.dispatch_ready_nodes(
+                    plan_id=current_plan_id,
+                    user_id=state["user_id"],
+                    domain=state["domain"],
+                    session_id=thread_id,
+                    dispatch_map=dispatch_map,
+                )
+                plan_nodes = await db.get_plan_nodes(current_plan_id)
+                first_task_ids = [str(n["task_id"]) for n in plan_nodes if n.get("task_id")]
+                if first_task_ids:
+                    dispatched_task_id = first_task_ids[-1]
                 tool_outputs.append(
                     ToolMessage(
-                        tool_call_id=tool_call["id"],
-                        content=f"Task {task_id} dispatched to {queue}. I will notify you when complete."
+                        tool_call_id=delegate_calls[0]["id"],
+                        content=(
+                            f"Plan {current_plan_id} created with {len(plan_nodes)} node(s). "
+                            f"Dispatched {dispatch_result.get('dispatched', 0)} ready node(s)."
+                        ),
                     )
                 )
-                dispatched_task_id = str(task_id)
+            except PlanValidationError as ve:
+                tool_outputs.append(
+                    ToolMessage(
+                        tool_call_id=delegate_calls[0]["id"],
+                        content=f"ERROR: Plan validation failed: {ve}",
+                    )
+                )
+            except Exception as e:
+                logger.error("Plan dispatch error: %s", e, exc_info=True)
+                tool_outputs.append(
+                    ToolMessage(
+                        tool_call_id=delegate_calls[0]["id"],
+                        content=f"ERROR: Failed to create/dispatch plan: {e}",
+                    )
+                )
 
-            elif tool_name == "QueueBatch":
+        for tool_call in batch_calls:
+            args = tool_call["args"]
+            if tool_call["name"] == "QueueBatch":
                 # Create Batch Job with full schema compliance
                 batch_id = await db.create_batch_job(
                     user_id=UUID(state["user_id"]),
@@ -413,6 +371,8 @@ class OrchestratorGraph:
         result = {"messages": tool_outputs}
         if dispatched_task_id:
             result["current_task_id"] = dispatched_task_id
+        if current_plan_id:
+            result["current_plan_id"] = current_plan_id
         return result
 
     # --- Public Interface ---
@@ -452,7 +412,8 @@ class OrchestratorGraph:
         
         return {
             "response": response_text,
-            "task_id": final_state.get("current_task_id")
+            "task_id": final_state.get("current_task_id"),
+            "plan_id": final_state.get("current_plan_id"),
         }
 
     async def stream_message(self, user_id: str, domain: str, message: str, thread_id: str, role: str = "user"):
@@ -485,6 +446,7 @@ class OrchestratorGraph:
 
         full_response = ""
         task_id = None
+        plan_id = None
 
         try:
             async for event in self.workflow.astream_events(
@@ -515,6 +477,8 @@ class OrchestratorGraph:
                         # Capture task_id from dispatcher's state update
                         if output.get("current_task_id"):
                             task_id = output["current_task_id"]
+                        if output.get("current_plan_id"):
+                            plan_id = output["current_plan_id"]
                         messages = output.get("messages", [])
                         for msg in messages:
                             if hasattr(msg, "content") and isinstance(msg, ToolMessage):
@@ -527,6 +491,9 @@ class OrchestratorGraph:
                     snapshot_task_id = final_snapshot.values.get("current_task_id")
                     if snapshot_task_id:
                         task_id = snapshot_task_id
+                    snapshot_plan_id = final_snapshot.values.get("current_plan_id")
+                    if snapshot_plan_id:
+                        plan_id = snapshot_plan_id
                     # Get the final response from last message if streaming missed it
                     msgs = final_snapshot.values.get("messages", [])
                     if msgs:
@@ -540,7 +507,7 @@ class OrchestratorGraph:
 
             yield {
                 "event": "done",
-                "data": {"response": full_response, "task_id": task_id},
+                "data": {"response": full_response, "task_id": task_id, "plan_id": plan_id},
             }
 
         except Exception as exc:
@@ -554,6 +521,7 @@ class OrchestratorGraph:
                         "data": {
                             "response": fallback.get("response", ""),
                             "task_id": fallback.get("task_id"),
+                            "plan_id": fallback.get("plan_id"),
                         },
                     }
                     return

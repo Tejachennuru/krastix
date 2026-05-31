@@ -47,6 +47,8 @@ services:
       - OLLAMA_MODEL=${OLLAMA_MODEL}
       - GROK_API_KEY=${GROK_API_KEY}
       - JWT_SECRET=${JWT_SECRET}
+      - CALLBACK_SIGNING_SECRET=${CALLBACK_SIGNING_SECRET}
+      - CALLBACK_MAX_SKEW_SECONDS=${CALLBACK_MAX_SKEW_SECONDS:-300}
     depends_on:
       redis:
         condition: service_healthy
@@ -76,6 +78,7 @@ services:
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL}
       - OLLAMA_MODEL=${OLLAMA_MODEL}
       - ORCHESTRATOR_URL=http://orchestrator:8000
+      - CALLBACK_SIGNING_SECRET=${CALLBACK_SIGNING_SECRET}
     depends_on:
       redis:
         condition: service_healthy
@@ -105,6 +108,7 @@ services:
       - SCRAPECREATORS_API_KEY=${SCRAPECREATORS_API_KEY}
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL}
       - OLLAMA_MODEL=${OLLAMA_MODEL}
+      - CALLBACK_SIGNING_SECRET=${CALLBACK_SIGNING_SECRET}
     volumes:
       - ./agents/research_agent:/app
     command: uvicorn src.main:app --host 0.0.0.0 --port 8001 --reload
@@ -130,6 +134,7 @@ services:
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL}
       - OLLAMA_MODEL=${OLLAMA_MODEL}
       - ORCHESTRATOR_URL=http://orchestrator:8000
+      - CALLBACK_SIGNING_SECRET=${CALLBACK_SIGNING_SECRET}
     depends_on:
       redis:
         condition: service_healthy
@@ -158,6 +163,7 @@ services:
       - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
       - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET}
       - INTEGRATIONS_ENCRYPTION_KEY=${INTEGRATIONS_ENCRYPTION_KEY}
+      - CALLBACK_SIGNING_SECRET=${CALLBACK_SIGNING_SECRET}
     depends_on:
       redis:
         condition: service_healthy
@@ -210,6 +216,7 @@ services:
       - GROQ_VISION_MODEL=${GROQ_VISION_MODEL:-llama-3.2-90b-vision-preview}
       - ORCHESTRATOR_URL=http://orchestrator:8000
       - STORAGE_BUCKET=${STORAGE_BUCKET:-documents}
+      - CALLBACK_SIGNING_SECRET=${CALLBACK_SIGNING_SECRET}
     volumes:
       - ./agents/doc_agent/src:/app/src
       - ./shared:/app/shared

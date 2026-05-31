@@ -3,6 +3,7 @@ import httpx
 from fastapi import FastAPI, BackgroundTasks
 from src.models import ResearchTask, AgentResponse
 from src.graph import ResearchGraph
+from shared.callbacks import notify_task_completed
 
 app = FastAPI(title="Krastix Research Agent (LangGraph)")
 graph_engine = ResearchGraph()
@@ -58,38 +59,24 @@ async def execute_task_bg(task: ResearchTask):
             "summary": summary,
         }
         
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            try:
-                await client.post(
-                    f"{ORCHESTRATOR_URL}/callbacks/task-completed",
-                    json={
-                        "task_id": task_id,
-                        "status": "success",
-                        "result": callback_result,
-                        "error": None,
-                    },
-                )
-            except Exception as e:
-                print(f"Callback delivery failed (task watcher will catch): {e}")
+        await notify_task_completed(
+            task_id=task_id,
+            status="completed",
+            result=callback_result,
+            error=None,
+        )
         
         print(f"Task Completed: {task.query_or_url} ({ingested_count} chunks)")
 
     except Exception as exc:
         print(f"Task failed: {exc}")
         # Send failure callback
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            try:
-                await client.post(
-                    f"{ORCHESTRATOR_URL}/callbacks/task-completed",
-                    json={
-                        "task_id": task_id,
-                        "status": "failed",
-                        "result": None,
-                        "error": str(exc),
-                    },
-                )
-            except Exception as cb_exc:
-                print(f"Failure callback also failed: {cb_exc}")
+        await notify_task_completed(
+            task_id=task_id,
+            status="failed",
+            result=None,
+            error=str(exc),
+        )
 
 @app.post("/research/run", response_model=AgentResponse)
 async def run_research(task: ResearchTask, bg: BackgroundTasks):

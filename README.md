@@ -69,6 +69,9 @@ GOOGLE_REDIRECT_URI=http://localhost:8000/api/v1/integrations/google/oauth/callb
 # Integration secret encryption (Fernet key, generate once and keep private)
 INTEGRATIONS_ENCRYPTION_KEY=...
 
+# Callback signing secret for agent -> orchestrator task callbacks
+CALLBACK_SIGNING_SECRET=...
+
 # Optional keepalive token for external cron pings
 KEEPALIVE_TOKEN=...
 
@@ -92,6 +95,8 @@ Or for existing databases, apply the incremental migration:
 psql "$DATABASE_URL" -f migrations/002_universal_engine.sql
 psql "$DATABASE_URL" -f migrations/003_doc_agent.sql
 psql "$DATABASE_URL" -f migrations/004_communication_agent.sql
+psql "$DATABASE_URL" -f migrations/005_phase0_stabilization.sql
+psql "$DATABASE_URL" -f migrations/006_phase1_planner_scheduler.sql
 ```
 
 ### 3. Start Services

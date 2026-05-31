@@ -381,6 +381,8 @@ class FormWorker:
             
             if not task:
                 return {"error": "Task not found"}
+
+            await db.mark_task_running(str(task_id))
                 
             input_payload = task["input_payload"]
             if isinstance(input_payload, str):
@@ -520,7 +522,7 @@ class FormWorker:
             
             await notify_task_completed(
                 task_id=str(task_id),
-                status="success" if final_status == "completed" else "failed",
+                status=final_status,
                 result=result,
                 error=result.get("error"),
             )

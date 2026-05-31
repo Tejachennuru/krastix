@@ -7,6 +7,7 @@
 -- --------------------------------------------
 -- 1. EXTENSIONS
 -- --------------------------------------------
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
 CREATE EXTENSION IF NOT EXISTS vector;
 
 -- --------------------------------------------
@@ -44,6 +45,7 @@ CREATE TABLE IF NOT EXISTS domain_configs (
 -- Entity Registry: Defines the "Shape" of data (The Rulebook)
 CREATE TABLE IF NOT EXISTS entity_definitions (
     entity_type VARCHAR(100) PRIMARY KEY,
+    display_name VARCHAR(255),
     description TEXT,
     validation_schema JSONB NOT NULL,
     created_at TIMESTAMPTZ DEFAULT NOW()
@@ -99,12 +101,18 @@ CREATE TABLE IF NOT EXISTS batch_jobs (
 
 -- Agent Registry: Dynamic agent discovery (Registry Pattern)
 CREATE TABLE IF NOT EXISTS agent_registry (
-    agent_id VARCHAR(100) PRIMARY KEY,
-    queue VARCHAR(100) NOT NULL,
-    capabilities JSONB NOT NULL DEFAULT '[]'::jsonb,
+    agent_key VARCHAR(100) PRIMARY KEY,
+    agent_id VARCHAR(100) UNIQUE,
+    display_name VARCHAR(255) NOT NULL,
+    queue VARCHAR(100), -- legacy compatibility
+    queue_or_url VARCHAR(255) NOT NULL,
+    dispatch_method VARCHAR(50) NOT NULL DEFAULT 'celery',
+    capabilities JSONB NOT NULL DEFAULT '{}'::jsonb,
     supported_domains JSONB NOT NULL DEFAULT '[]'::jsonb,
     description TEXT,
     health_endpoint VARCHAR(255),
+    enabled BOOLEAN NOT NULL DEFAULT true,
+    version INTEGER NOT NULL DEFAULT 1,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -129,16 +137,108 @@ CREATE TABLE IF NOT EXISTS agent_tasks (
     user_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
     domain_key VARCHAR(100) NOT NULL,
     agent_queue VARCHAR(100) NOT NULL,
-    status VARCHAR(50) DEFAULT 'pending',
+    status VARCHAR(50) NOT NULL DEFAULT 'created',
     input_payload JSONB NOT NULL,
     output_result JSONB,
     error_message TEXT,
+    error_code VARCHAR(100),
+    error_detail TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_heartbeat_at TIMESTAMPTZ,
+    correlation_id UUID NOT NULL DEFAULT gen_random_uuid(),
+    queued_at TIMESTAMPTZ,
+    dispatched_at TIMESTAMPTZ,
+    started_at TIMESTAMPTZ,
+    callback_received_at TIMESTAMPTZ,
+    callback_idempotency_key VARCHAR(255),
     created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
     completed_at TIMESTAMPTZ
 );
+ALTER TABLE agent_tasks
+    DROP CONSTRAINT IF EXISTS agent_tasks_status_check;
+ALTER TABLE agent_tasks
+    ADD CONSTRAINT agent_tasks_status_check
+    CHECK (status IN ('created', 'queued', 'dispatched', 'running', 'completed', 'failed', 'cancelled', 'timed_out', 'stale'));
 CREATE INDEX IF NOT EXISTS idx_agent_tasks_status ON agent_tasks(status);
 CREATE INDEX IF NOT EXISTS idx_agent_tasks_user ON agent_tasks(user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_agent_tasks_session_id ON agent_tasks ((input_payload->>'session_id'));
+CREATE INDEX IF NOT EXISTS idx_agent_tasks_correlation_id ON agent_tasks(correlation_id);
+
+CREATE TABLE IF NOT EXISTS agent_task_callbacks (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    task_id UUID NOT NULL REFERENCES agent_tasks(task_id) ON DELETE CASCADE,
+    idempotency_key VARCHAR(255) NOT NULL UNIQUE,
+    payload_hash VARCHAR(64) NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_agent_task_callbacks_task_id ON agent_task_callbacks(task_id);
+
+CREATE TABLE IF NOT EXISTS plans (
+    plan_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+    domain_key VARCHAR(100) NOT NULL,
+    session_id UUID,
+    source_message TEXT,
+    status VARCHAR(50) NOT NULL DEFAULT 'created',
+    summary TEXT,
+    error_detail TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    completed_at TIMESTAMPTZ
+);
+ALTER TABLE plans
+    DROP CONSTRAINT IF EXISTS plans_status_check;
+ALTER TABLE plans
+    ADD CONSTRAINT plans_status_check
+    CHECK (status IN ('created', 'running', 'completed', 'completed_with_failures', 'failed', 'cancelled'));
+CREATE INDEX IF NOT EXISTS idx_plans_user_created ON plans(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_plans_status ON plans(status);
+CREATE INDEX IF NOT EXISTS idx_plans_session ON plans(session_id);
+
+CREATE TABLE IF NOT EXISTS plan_nodes (
+    node_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    plan_id UUID NOT NULL REFERENCES plans(plan_id) ON DELETE CASCADE,
+    node_key VARCHAR(120) NOT NULL,
+    node_type VARCHAR(50) NOT NULL DEFAULT 'agent_task',
+    status VARCHAR(50) NOT NULL DEFAULT 'pending',
+    agent_queue VARCHAR(255) NOT NULL,
+    instruction TEXT NOT NULL,
+    task_action VARCHAR(120),
+    parameters JSONB NOT NULL DEFAULT '{}'::jsonb,
+    priority INTEGER NOT NULL DEFAULT 1,
+    dependencies JSONB NOT NULL DEFAULT '[]'::jsonb,
+    task_id UUID REFERENCES agent_tasks(task_id) ON DELETE SET NULL,
+    result JSONB,
+    error_code VARCHAR(100),
+    error_detail TEXT,
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(plan_id, node_key)
+);
+ALTER TABLE plan_nodes
+    DROP CONSTRAINT IF EXISTS plan_nodes_status_check;
+ALTER TABLE plan_nodes
+    ADD CONSTRAINT plan_nodes_status_check
+    CHECK (status IN ('pending', 'ready', 'queued', 'dispatched', 'running', 'completed', 'failed', 'cancelled', 'blocked'));
+CREATE INDEX IF NOT EXISTS idx_plan_nodes_plan_status ON plan_nodes(plan_id, status);
+CREATE INDEX IF NOT EXISTS idx_plan_nodes_task_id ON plan_nodes(task_id);
+
+CREATE TABLE IF NOT EXISTS plan_events (
+    event_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    plan_id UUID NOT NULL REFERENCES plans(plan_id) ON DELETE CASCADE,
+    node_id UUID REFERENCES plan_nodes(node_id) ON DELETE CASCADE,
+    event_type VARCHAR(100) NOT NULL,
+    event_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_plan_events_plan_created ON plan_events(plan_id, created_at);
+
+ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS plan_id UUID REFERENCES plans(plan_id) ON DELETE SET NULL;
+ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS plan_node_id UUID REFERENCES plan_nodes(node_id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_agent_tasks_plan_id ON agent_tasks(plan_id);
 
 CREATE TABLE IF NOT EXISTS conversations (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -206,6 +306,10 @@ ALTER TABLE entity_definitions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE entities ENABLE ROW LEVEL SECURITY;
 ALTER TABLE entity_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agent_tasks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agent_task_callbacks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE plans ENABLE ROW LEVEL SECURITY;
+ALTER TABLE plan_nodes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE plan_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE conversations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE memories ENABLE ROW LEVEL SECURITY;
 ALTER TABLE integrations ENABLE ROW LEVEL SECURITY;
@@ -229,6 +333,39 @@ EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 DO $$ BEGIN
     CREATE POLICY "user_owns_tasks" ON agent_tasks FOR ALL USING (auth.uid() = user_id);
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    CREATE POLICY "user_owns_task_callbacks" ON agent_task_callbacks
+        FOR ALL USING (
+            auth.uid() = (
+                SELECT user_id
+                FROM agent_tasks
+                WHERE task_id = agent_task_callbacks.task_id
+            )
+        );
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    CREATE POLICY "user_owns_plans" ON plans FOR ALL USING (auth.uid() = user_id);
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    CREATE POLICY "user_owns_plan_nodes" ON plan_nodes
+        FOR ALL USING (
+            auth.uid() = (
+                SELECT user_id FROM plans WHERE plan_id = plan_nodes.plan_id
+            )
+        );
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    CREATE POLICY "user_owns_plan_events" ON plan_events
+        FOR ALL USING (
+            auth.uid() = (
+                SELECT user_id FROM plans WHERE plan_id = plan_events.plan_id
+            )
+        );
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 DO $$ BEGIN
@@ -275,6 +412,22 @@ EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 DO $$ BEGIN
     CREATE POLICY "service_full_access_tasks" ON agent_tasks FOR ALL USING (auth.role() = 'service_role');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    CREATE POLICY "service_full_access_task_callbacks" ON agent_task_callbacks FOR ALL USING (auth.role() = 'service_role');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    CREATE POLICY "service_full_access_plans" ON plans FOR ALL USING (auth.role() = 'service_role');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    CREATE POLICY "service_full_access_plan_nodes" ON plan_nodes FOR ALL USING (auth.role() = 'service_role');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    CREATE POLICY "service_full_access_plan_events" ON plan_events FOR ALL USING (auth.role() = 'service_role');
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 DO $$ BEGIN
@@ -463,43 +616,94 @@ CREATE INDEX IF NOT EXISTS idx_entities_email_draft_session_status
     WHERE entity_type = 'email_draft';
 
 -- 9.3 Seed Agent Registry
-INSERT INTO agent_registry (agent_id, queue, capabilities, supported_domains, description, health_endpoint) VALUES
+INSERT INTO agent_registry (
+    agent_key, agent_id, display_name, queue, queue_or_url, dispatch_method,
+    capabilities, supported_domains, description, health_endpoint, enabled, version
+) VALUES
 (
     'crm_universal_v1',
+    'crm_universal_v1',
+    'CRM Agent',
     'crm_queue',
-    '["upsert_entity", "get_entities"]'::jsonb,
+    'crm_queue',
+    'celery',
+    '{
+        "actions": ["upsert_entity", "get_entities"],
+        "description": "Universal CRM operations with schema validation and optimistic concurrency.",
+        "celery_task_name": "agents.crm_worker.execute_task"
+    }'::jsonb,
     '["HR_RECRUITER", "SALES_LEAD_GEN"]'::jsonb,
-    'Universal CRM agent — manages entities (candidates, leads, contacts) with schema validation and optimistic concurrency.',
-    NULL
+    'Universal CRM agent - manages entities (candidates, leads, contacts) with schema validation and optimistic concurrency.',
+    NULL,
+    true,
+    1
 ),
 (
     'form_tally_v1',
+    'form_tally_v1',
+    'Form Agent',
     'form_queue',
-    '["create_form", "list_forms"]'::jsonb,
+    'form_queue',
+    'celery',
+    '{
+        "actions": ["create_form", "list_forms", "list_form_responses"],
+        "description": "Creates and manages Tally forms.",
+        "celery_task_name": "agents.form_worker.execute_task"
+    }'::jsonb,
     '["HR_RECRUITER"]'::jsonb,
-    'Form builder agent — creates and manages Tally.so forms for applications and surveys.',
-    NULL
+    'Form builder agent - creates and manages Tally.so forms for applications and surveys.',
+    NULL,
+    true,
+    1
 ),
 (
     'research_firecrawl_v1',
+    'research_firecrawl_v1',
+    'Research Agent',
     'research_queue',
-    '["web_search", "scrape_url", "linkedin_profile", "linkedin_company", "site_map"]'::jsonb,
+    'research_queue',
+    'http',
+    '{
+        "actions": ["web_search", "scrape_url", "linkedin_profile", "linkedin_company", "site_map"],
+        "description": "Web research and enrichment.",
+        "http_endpoint": "/research/run",
+        "base_url": "http://research_agent:8001"
+    }'::jsonb,
     '["HR_RECRUITER", "PERSONAL_ASSISTANT", "SALES_LEAD_GEN"]'::jsonb,
-    'Research agent — performs web searches, scrapes pages, maps sites, and retrieves LinkedIn data.',
-    'http://research_agent:8001/health'
+    'Research agent - performs web searches, scrapes pages, maps sites, and retrieves LinkedIn data.',
+    'http://research_agent:8001/health',
+    true,
+    1
 ),
 (
     'communication_gmail_v1',
+    'communication_gmail_v1',
+    'Communication Agent (Gmail)',
     'communication_queue',
-    '["send_email"]'::jsonb,
+    'communication_queue',
+    'celery',
+    '{
+        "actions": ["send_email"],
+        "description": "Sends approved emails using Gmail OAuth from the signed-in account.",
+        "celery_task_name": "agents.communication_worker.execute_task"
+    }'::jsonb,
     '["HR_RECRUITER", "PERSONAL_ASSISTANT"]'::jsonb,
-    'Communication agent — sends approved emails using Gmail OAuth from the signed-in account.',
-    NULL
+    'Communication agent - sends approved emails using Gmail OAuth from the signed-in account.',
+    NULL,
+    true,
+    1
 )
-ON CONFLICT (agent_id) DO UPDATE SET
+ON CONFLICT (agent_key) DO UPDATE SET
+    display_name = EXCLUDED.display_name,
+    queue = EXCLUDED.queue,
+    queue_or_url = EXCLUDED.queue_or_url,
+    dispatch_method = EXCLUDED.dispatch_method,
     capabilities = EXCLUDED.capabilities,
     supported_domains = EXCLUDED.supported_domains,
     description = EXCLUDED.description,
+    health_endpoint = EXCLUDED.health_endpoint,
+    enabled = EXCLUDED.enabled,
+    version = EXCLUDED.version,
     updated_at = NOW();
 
 -- 9.4 Seed additional entity definitions
@@ -545,4 +749,5 @@ ON CONFLICT (email) DO NOTHING;
 -- ============================================
 -- SCHEMA DEPLOYMENT COMPLETE
 -- ============================================
+
 

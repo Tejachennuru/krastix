@@ -483,7 +483,7 @@ export default function ChatPage() {
             appendMessage('assistant', `Task complete.\n${JSON.stringify(data.result, null, 2)}`);
           }
           handledTaskIdsRef.current.add(taskId);
-        } else if (data.status === 'failed' || data.status === 'stale') {
+        } else if (['failed', 'stale', 'timed_out', 'cancelled'].includes(data.status)) {
           appendMessage('assistant', `Task failed: ${data.error || 'Timeout or unknown error'}`);
           handledTaskIdsRef.current.add(taskId);
         } else {

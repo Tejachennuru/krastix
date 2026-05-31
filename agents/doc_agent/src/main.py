@@ -22,6 +22,7 @@ import httpx
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 
+from shared.callbacks import notify_task_completed
 from src.config import (
     ORCHESTRATOR_URL,
     VLM_MODEL,
@@ -287,16 +288,12 @@ async def execute_document_task(task: DocumentTask) -> None:
             "summary": _build_summary(entity_type, grounded_data, extracted_fields),
         }
 
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            await client.post(
-                f"{ORCHESTRATOR_URL}/callbacks/task-completed",
-                json={
-                    "task_id": task_id,
-                    "status": "success" if status != "error" else "failed",
-                    "result": callback_result,
-                    "error": result.get("error"),
-                },
-            )
+        await notify_task_completed(
+            task_id=task_id,
+            status="completed" if status != "error" else "failed",
+            result=callback_result,
+            error=result.get("error"),
+        )
 
         logger.info("Task %s completed and callback sent", task_id)
 
@@ -305,19 +302,14 @@ async def execute_document_task(task: DocumentTask) -> None:
         logger.error(error_msg, exc_info=True)
 
         # Send failure callback
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                await client.post(
-                    f"{ORCHESTRATOR_URL}/callbacks/task-completed",
-                    json={
-                        "task_id": task_id,
-                        "status": "failed",
-                        "result": None,
-                        "error": error_msg,
-                    },
-                )
-        except Exception as cb_exc:
-            logger.error("Failure callback also failed: %s", cb_exc)
+        callback_ok = await notify_task_completed(
+            task_id=task_id,
+            status="failed",
+            result=None,
+            error=error_msg,
+        )
+        if not callback_ok:
+            logger.error("Failure callback delivery failed for task %s", task_id)
 
 
 def _build_summary(
